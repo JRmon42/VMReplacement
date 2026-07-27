@@ -23,11 +23,13 @@ for VM in "${!MAP[@]}"; do
       --enable-secure-boot true --enable-vtpm true -o none || {
       echo "    Trusted Launch upgrade not applicable; verify OS Gen2 readiness."; }
 
-  # 3) Switch disk controller to NVMe (Gen2 + NVMe-capable OS required):
-  az vm update -g "$RG" -n "$VM" --set storageProfile.diskControllerType=NVMe -o none
+  # 3) Resize to the v6 SKU AND switch the disk controller to NVMe in a SINGLE update.
+  #    NVMe cannot be set while the VM is still on a SCSI-only size (e.g. DSv2), so both
+  #    properties must change together in the same 'az vm update' call.
+  az vm update -g "$RG" -n "$VM" \
+      --set hardwareProfile.vmSize="$TARGET" storageProfile.diskControllerType=NVMe -o none
 
-  # 4) Resize to the v6 SKU and start:
-  az vm resize -g "$RG" -n "$VM" --size "$TARGET" -o none
+  # 4) Start:
   az vm start  -g "$RG" -n "$VM" -o none
   echo "    upgraded & started. Validate boot + app health."
 done
