@@ -28,4 +28,13 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
   instant rollback, Script `03F` (`03-fsv2-bluegreen-to-v6.sh`). Enhanced (MfgTransNonProd)
   VMs target `Standard_F8als_v6`; standard VMs target `Standard_F4als_v6`.
 
+> **In-place NVMe note (scripts 02 / 02F):** an older Gen1 OS disk does not advertise NVMe,
+> so a naive resize fails with *"Disk Controller Type property 'NVMe' is not supported by the
+> OS image or disk"*. The 02 scripts handle this: they (0) snapshot the OS disk, (1) prepare
+> the guest OS for NVMe (nvme in initramfs, GRUB `nvme_core.io_timeout=240`, fstab UUIDs),
+> (2) convert Gen1->Gen2/Trusted Launch, (3) tag the OS disk
+> `supportedCapabilities.diskControllerTypes='SCSI, NVMe'`, then (4) change size + NVMe in a
+> single `az vm update`. Microsoft's `Azure-NVMe-Conversion.ps1 -FixOperatingSystemSettings`
+> is the supported alternative.
+
 Always run **00** first.
