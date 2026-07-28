@@ -43,5 +43,19 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 > `supportedCapabilities.diskControllerTypes='SCSI, NVMe'` (the Terraform config does this via
 > a `null_resource` + `az disk update`). Also prepare the **source** guest OS for NVMe (script
 > 02 step 1) *before* snapshotting, otherwise the new VM will not boot.
+>
+> **Guest verification is now enforced (scripts 02 / 02F):** step 1 rebuilds the initramfs with
+> the `nvme` driver, sets the GRUB timeout, then **verifies** that `nvme` is actually in the
+> initramfs and that `/etc/fstab` uses UUIDs. If the guest is not NVMe-ready the script **aborts
+> that VM without deallocating**, so it stays bootable on SCSI. Never skip or rush this step: a
+> VM converted to an NVMe-only v6 size with an unprepared guest boots to a stuck state (portal
+> shows *running*, but no SSH/console).
+>
+> **Rollback of an already-converted VM (script 99):** once a VM is on an NVMe-only v6 size, a
+> plain OS-disk *swap* back to the original SCSI disk is rejected
+> (*"Swapping OS Disk is not allowed since Disk Controller Type property 'NVMe' ..."*).
+> `99-rollback.sh` now detects this, then **deletes the converted VM (keeping NIC + disks) and
+> recreates the original Gen1/SCSI VM** from the rollback disk on the original NIC/private IP.
+> Usage: `./99-rollback.sh <VM> <SNAPSHOT> [ORIGINAL_SIZE]` (e.g. `Standard_DS1_v2`).
 
 Always run **00** first.
