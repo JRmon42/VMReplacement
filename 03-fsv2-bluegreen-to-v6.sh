@@ -2,6 +2,16 @@
 # MID-SERVER (MFG) - OPTION 2: Blue/green from snapshot. Lowest SERVICE interruption + instant rollback.
 # Builds a NEW Gen2/NVMe F-series v6 VM from the OS-disk snapshot; original keeps serving until cutover.
 # Use this when the F4s_v2 VM is Gen1 (V1 OS disk) and cannot resize to v6 directly.
+#
+# NOTE (NVMe readiness): the F-series v6 sizes require the NVMe disk controller. Two things must
+# be true or the staging VM will fail to create/boot:
+#   (a) the SOURCE guest OS must be NVMe-ready BEFORE you snapshot it (nvme in initramfs,
+#       GRUB nvme_core.io_timeout=240, /etc/fstab on UUIDs). Run script 02 step 1 on the source
+#       first if it has never booted on NVMe.
+#   (b) the OS disk copied from an old SCSI snapshot does NOT advertise NVMe, so we tag it with
+#       supportedCapabilities.diskControllerTypes='SCSI, NVMe' below before creating the v6 VM;
+#       otherwise 'az vm create --disk-controller-type NVMe' fails with
+#       "cannot boot with DiskControllerType 'NVMe'".
 set -euo pipefail
 RG="${RG:-myResourceGroup}"
 LOCATION="${LOCATION:-westeurope}"
@@ -23,6 +33,11 @@ echo "==> Creating Gen2/NVMe OS disk from snapshot $OS_SNAPSHOT"
 SNAP_ID=$(az snapshot show -g "$RG" -n "$OS_SNAPSHOT" --query id -o tsv)
 az disk create -g "$RG" -l "$LOCATION" -n "${SRC_VM}-osdisk-v6" \
     --source "$SNAP_ID" --hyper-v-generation V2 --sku Premium_LRS -o none
+
+# Tag the copied OS disk as NVMe-capable (a disk from an old SCSI snapshot does not advertise
+# NVMe, so the v6 VM create with --disk-controller-type NVMe would otherwise be rejected).
+az disk update -g "$RG" -n "${SRC_VM}-osdisk-v6" \
+    --set supportedCapabilities.diskControllerTypes='SCSI, NVMe' -o none
 
 echo "==> Creating staging $TARGET VM '$STAGE_VM' from the copied OS disk (attach, no reimage)"
 az vm create -g "$RG" -n "$STAGE_VM" --size "$TARGET" --location "$LOCATION" \

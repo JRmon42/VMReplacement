@@ -47,6 +47,15 @@ locals {
 }
 
 # 2) Gen2 OS disk created from the pre-migration snapshot.
+#
+# NVMe readiness (IMPORTANT):
+#   (a) The SOURCE guest OS must be NVMe-ready BEFORE the snapshot (nvme in initramfs,
+#       GRUB nvme_core.io_timeout=240, /etc/fstab on UUIDs) or the new VM will not boot.
+#       Run migration script 02 step 1 on the source first if it has never booted on NVMe.
+#   (b) A disk copied from an old SCSI snapshot does NOT advertise NVMe. azurerm has no
+#       argument for supportedCapabilities.diskControllerTypes, so the null_resource below
+#       tags it via CLI before the VM is created; otherwise disk_controller_type = "NVMe"
+#       is rejected with "cannot boot with DiskControllerType 'NVMe'".
 resource "azurerm_managed_disk" "v6_os" {
   name                 = "${local.src_vm}-osdisk-v6"
   resource_group_name  = var.resource_group_name
@@ -56,6 +65,17 @@ resource "azurerm_managed_disk" "v6_os" {
   source_resource_id   = var.os_snapshot_id
   hyper_v_generation   = "V2" # required for v6 / Trusted Launch
   os_type              = "Linux"
+}
+
+# 2b) Advertise NVMe on the copied OS disk (azurerm cannot set this natively).
+# Requires the Azure CLI to be installed and authenticated in the Terraform runner.
+resource "null_resource" "v6_os_nvme_capability" {
+  triggers = {
+    disk_id = azurerm_managed_disk.v6_os.id
+  }
+  provisioner "local-exec" {
+    command = "az disk update --ids ${azurerm_managed_disk.v6_os.id} --set supportedCapabilities.diskControllerTypes='SCSI, NVMe' -o none"
+  }
 }
 
 # NIC for the new VM. To preserve the ORIGINAL private IP, set a static address
@@ -91,6 +111,9 @@ resource "azurerm_linux_virtual_machine" "v6" {
   # (azurerm >= 4.x: os_managed_disk_id attaches an existing managed OS disk;
   #  no admin_username / SSH key is needed when attaching an existing disk.)
   os_managed_disk_id = azurerm_managed_disk.v6_os.id
+
+  # Ensure the OS disk advertises NVMe before this VM is created.
+  depends_on = [null_resource.v6_os_nvme_capability]
 
   os_disk {
     caching              = "ReadWrite"

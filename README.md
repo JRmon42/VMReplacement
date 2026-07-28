@@ -36,5 +36,12 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 > `supportedCapabilities.diskControllerTypes='SCSI, NVMe'`, then (4) change size + NVMe in a
 > single `az vm update`. Microsoft's `Azure-NVMe-Conversion.ps1 -FixOperatingSystemSettings`
 > is the supported alternative.
+>
+> **Blue/green NVMe note (scripts 03 / 03F and Terraform `groupB-v6-bluegreen`):** the same
+> requirement applies. The OS disk copied from an old SCSI snapshot does not advertise NVMe,
+> so before building the v6 VM the scripts tag it with
+> `supportedCapabilities.diskControllerTypes='SCSI, NVMe'` (the Terraform config does this via
+> a `null_resource` + `az disk update`). Also prepare the **source** guest OS for NVMe (script
+> 02 step 1) *before* snapshotting, otherwise the new VM will not boot.
 
 Always run **00** first.
