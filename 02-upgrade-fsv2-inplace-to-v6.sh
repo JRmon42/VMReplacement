@@ -74,9 +74,9 @@ for VM in "${!MAP[@]}"; do
     fi
     # VERIFY the NEWEST kernel initramfs actually contains nvme
     if command -v lsinitramfs >/dev/null 2>&1; then
-      IMG=$(ls -1v /boot/initrd.img-* 2>/dev/null | tail -n1); LISTER=lsinitramfs
+      IMG=$(ls -1v /boot/initrd.img-* 2>/dev/null | grep -v -- -rescue | tail -n1); LISTER=lsinitramfs
     else
-      IMG=$(ls -1v /boot/initramfs-*.img 2>/dev/null | tail -n1); LISTER=lsinitrd
+      IMG=$(ls -1v /boot/initramfs-*.img 2>/dev/null | grep -v kdump | tail -n1); LISTER=lsinitrd
     fi
     NVME_INITRAMFS=MISSING
     [ -n "$IMG" ] && "$LISTER" "$IMG" 2>/dev/null | grep -q nvme && NVME_INITRAMFS=OK

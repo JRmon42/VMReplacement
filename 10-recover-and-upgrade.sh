@@ -143,9 +143,9 @@ guest_prep_and_verify(){
       elif [ -d /boot/grub2 ]; then grub2-mkconfig -o /boot/grub2/grub.cfg; fi
     fi
     if command -v lsinitramfs >/dev/null 2>&1; then
-      IMG=$(ls -1v /boot/initrd.img-* 2>/dev/null | tail -n1); LISTER=lsinitramfs
+      IMG=$(ls -1v /boot/initrd.img-* 2>/dev/null | grep -v -- -rescue | tail -n1); LISTER=lsinitramfs
     else
-      IMG=$(ls -1v /boot/initramfs-*.img 2>/dev/null | tail -n1); LISTER=lsinitrd
+      IMG=$(ls -1v /boot/initramfs-*.img 2>/dev/null | grep -v kdump | tail -n1); LISTER=lsinitrd
     fi
     NVME_INITRAMFS=MISSING
     [ -n "$IMG" ] && "$LISTER" "$IMG" 2>/dev/null | grep -q nvme && NVME_INITRAMFS=OK
