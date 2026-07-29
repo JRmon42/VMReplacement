@@ -14,6 +14,7 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 | 03 | `03-dsv2-bluegreen-to-v6.sh` | DS1_v2, DS11_v2 | **Blue/green** from snapshot (lowest service interruption) |
 | 02F | `02-upgrade-fsv2-inplace-to-v6.sh` | MID servers: F4s_v2 -> F4als_v6 / F8als_v6 | In-place **Gen1->Gen2 + NVMe** then resize to F-series v6 |
 | 03F | `03-fsv2-bluegreen-to-v6.sh` | MID servers: F4s_v2 -> F4als_v6 / F8als_v6 | **Blue/green** from snapshot (lowest service interruption) |
+| 10 | `10-recover-and-upgrade.sh` | Any DSv2/Fsv2 -> v6 | **All-in-one**: rollback from a clean snapshot -> VERIFY SCSI boot -> hardened NVMe upgrade, with a printed banner per phase and PASS/FAIL per check |
 | 99 | `99-rollback.sh` | Any | Restore OS disk from a snapshot |
 
 ## Recommended path per VM
@@ -64,3 +65,28 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 > Usage: `./99-rollback.sh <VM> <SNAPSHOT> [ORIGINAL_SIZE]` (e.g. `Standard_DS1_v2`).
 
 Always run **00** first.
+
+### One-shot recover-and-upgrade (`10-recover-and-upgrade.sh`)
+
+If a VM was already broken by a failed NVMe conversion (dracut emergency shell,
+`system-lv_root does not exist`), use **10** to recover *and* redo the upgrade safely in a
+single, fully-instrumented run. Every phase prints a `==> PHASE` banner and every check prints
+`[  OK  ]` / `[ FAIL ]` with the observed value, so you always know where you are.
+
+Flow: **rollback** from a *clean pre-edit* snapshot -> **verify** it boots on SCSI ->
+**prep+verify** the guest (nvme in newest-kernel initramfs, `rd.lvm.lv`, fstab UUID; aborts if
+not ready, VM stays on SCSI) -> **proof reboot** on SCSI with the rebuilt initramfs ->
+**convert** to the v6 size + NVMe in one atomic update -> **verify** the NVMe boot (auto-suggests
+rollback if it fails).
+
+```bash
+# one line:
+RG=RG-RNDDEV-CFI01 VM=azurl41015 SNAPSHOT=azurl41015-os-PRE \
+TARGET_SIZE=Standard_D2s_v6 ROLLBACK_SIZE=Standard_DS1_v2 \
+bash 10-recover-and-upgrade.sh
+```
+
+Modes: `MODE=full` (default), `MODE=rollback-only`, `MODE=upgrade-only`. Set `DRYRUN=1` to print
+the state-changing az commands without running them. **SNAPSHOT must be a snapshot taken BEFORE
+any guest edit** — this is the lesson from the field failure (a snapshot captured after the guest
+was modified bakes in the broken initramfs and rollback then also fails).
