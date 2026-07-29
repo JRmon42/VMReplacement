@@ -32,9 +32,9 @@ for VM in "${!MAP[@]}"; do
   #    (portal shows "running" but there is no SSH/console because the kernel cannot mount root).
   #    Handles BOTH Debian/Ubuntu (update-initramfs) and RHEL/SLES + LVM (dracut). It:
   #      - rebuilds the initramfs for ALL installed kernels with the nvme drivers,
-  #      - adds nvme_core.io_timeout=240 and, when root is on LVM, rd.lvm.lv=<vg>/<lv>
+  #      - adds nvme_core.io_timeout=240 and, when root is on LVM, rd.lvm.vg=<vg> (whole VG)
   #        (via grubby on RHEL/BLS, else /etc/default/grub) so the LVM root auto-activates,
-  #      - VERIFIES the NEWEST kernel's initramfs really contains nvme, that rd.lvm.lv is present
+  #      - VERIFIES the NEWEST kernel's initramfs really contains nvme, that rd.lvm.vg is present
   #        when root is LVM, and that /etc/fstab does not use /dev/sdX.
   #    If not NVMe-ready we ABORT for this VM (no deallocate) so it stays bootable on SCSI.
   #    Windows / non-Linux: use Microsoft's Azure-NVMe-Conversion.ps1 instead.
@@ -49,15 +49,15 @@ for VM in "${!MAP[@]}"; do
       grep -q "^nvme" /etc/initramfs-tools/modules || echo nvme >> /etc/initramfs-tools/modules
       update-initramfs -u -k all
     fi
-    # detect LVM root and build rd.lvm.lv=<vg>/<lv>
+    # detect LVM root VG and activate the WHOLE VG (rd.lvm.vg) so a separate /usr,/var LV also activates
     ROOT_SRC=$(findmnt -no SOURCE / || true)
     RDLVM=""
     if command -v lvs >/dev/null 2>&1 && lvs "$ROOT_SRC" >/dev/null 2>&1; then
       VG=$(lvs --noheadings -o vg_name "$ROOT_SRC" | tr -d " ")
       LV=$(lvs --noheadings -o lv_name "$ROOT_SRC" | tr -d " ")
-      RDLVM="rd.lvm.lv=${VG}/${LV}"
+      RDLVM="rd.lvm.vg=${VG}"
     fi
-    ARGS="nvme_core.io_timeout=240 ${RDLVM}"
+    ARGS="rd.auto nvme_core.io_timeout=240 ${RDLVM}"
     # apply kernel cmdline args (grubby for RHEL/BLS, else /etc/default/grub)
     if command -v grubby >/dev/null 2>&1; then
       grubby --update-kernel=ALL --args="$ARGS" || true
@@ -76,12 +76,12 @@ for VM in "${!MAP[@]}"; do
     fi
     NVME_INITRAMFS=MISSING
     [ -n "$IMG" ] && "$LISTER" "$IMG" 2>/dev/null | grep -q nvme && NVME_INITRAMFS=OK
-    # verify rd.lvm.lv is present when root is LVM
+    # verify rd.lvm.vg is present when root is LVM
     LVM_OK=OK
     if [ -n "$RDLVM" ]; then
-      if grep -rq "rd.lvm.lv" /boot/loader/entries/ 2>/dev/null \
-         || grep -q "rd.lvm.lv" /boot/grub2/grub.cfg 2>/dev/null \
-         || grep -q "rd.lvm.lv" /boot/grub/grub.cfg 2>/dev/null; then LVM_OK=OK; else LVM_OK=MISSING; fi
+      if grep -rq "rd.lvm.vg" /boot/loader/entries/ 2>/dev/null \
+         || grep -q "rd.lvm.vg" /boot/grub2/grub.cfg 2>/dev/null \
+         || grep -q "rd.lvm.vg" /boot/grub/grub.cfg 2>/dev/null; then LVM_OK=OK; else LVM_OK=MISSING; fi
     fi
     # fstab must not reference /dev/sdX
     FSTAB_OK=OK
@@ -95,7 +95,7 @@ for VM in "${!MAP[@]}"; do
   echo "$PREP_MSG"
   if ! grep -q "NVME_READY=YES" <<<"$PREP_MSG"; then
     echo "    !! ABORT $VM: guest is NOT NVMe-ready (nvme missing from newest-kernel initramfs,"
-    echo "       rd.lvm.lv missing for an LVM root, or /etc/fstab uses /dev/sdX)."
+    echo "       rd.lvm.vg missing for an LVM root, or /etc/fstab uses /dev/sdX)."
     echo "       Remediate inside the guest, then re-run. The VM was NOT deallocated and stays bootable on SCSI."
     continue
   fi

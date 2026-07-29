@@ -96,7 +96,10 @@ wait_boot(){
   step "Waiting for guest to boot & report health (up to $((tries*15/60)) min)..."
   for ((i=1;i<=tries;i++)); do
     # shellcheck disable=SC2016
-    out=$(az vm run-command invoke -g "$RG" -n "$VM" --command-id RunShellScript --scripts '
+    # NOTE: wrap in `timeout` - when the guest agent is down (e.g. dracut emergency
+    # shell) `az vm run-command invoke` blocks for the extension timeout (~90 min).
+    # Bounding each poll makes boot-failure detection actually fire within BOOT_TRIES.
+    out=$(timeout 120 az vm run-command invoke -g "$RG" -n "$VM" --command-id RunShellScript --scripts '
       echo BOOT_OK
       echo "KERNEL=$(uname -r)"
       echo "ROOT=$(findmnt -no SOURCE / 2>/dev/null)"
@@ -116,7 +119,9 @@ wait_boot(){
 # Guest NVMe prep + VERIFY (identical logic to 02-*.sh). Echoes NVME_READY=YES/NO.
 guest_prep_and_verify(){
   # shellcheck disable=SC2016  # $(...) / $VARs must run inside the guest, not expand locally
-  az vm run-command invoke -g "$RG" -n "$VM" --command-id RunShellScript --scripts '
+  # `timeout 600` bounds the dracut rebuild; if it overruns, NVME_READY is absent and
+  # the caller aborts WITHOUT deallocating, so the VM stays bootable on SCSI.
+  timeout 600 az vm run-command invoke -g "$RG" -n "$VM" --command-id RunShellScript --scripts '
     set -e
     if command -v dracut >/dev/null 2>&1; then
       echo "add_drivers+=\" nvme nvme_core hv_storvsc \"" > /etc/dracut.conf.d/nvme.conf
@@ -130,7 +135,7 @@ guest_prep_and_verify(){
     if command -v lvs >/dev/null 2>&1 && lvs "$ROOT_SRC" >/dev/null 2>&1; then
       VG=$(lvs --noheadings -o vg_name "$ROOT_SRC" | tr -d " ")
       LV=$(lvs --noheadings -o lv_name "$ROOT_SRC" | tr -d " ")
-      RDLVM="rd.lvm.lv=${VG}/${LV}"
+      RDLVM="rd.lvm.vg=${VG}"
     fi
     ARGS="rd.auto nvme_core.io_timeout=240 ${RDLVM}"
     if command -v grubby >/dev/null 2>&1; then
@@ -151,9 +156,9 @@ guest_prep_and_verify(){
     [ -n "$IMG" ] && "$LISTER" "$IMG" 2>/dev/null | grep -q nvme && NVME_INITRAMFS=OK
     LVM_OK=OK
     if [ -n "$RDLVM" ]; then
-      if grep -rq "rd.lvm.lv" /boot/loader/entries/ 2>/dev/null \
-         || grep -q "rd.lvm.lv" /boot/grub2/grub.cfg 2>/dev/null \
-         || grep -q "rd.lvm.lv" /boot/grub/grub.cfg 2>/dev/null; then LVM_OK=OK; else LVM_OK=MISSING; fi
+      if grep -rq "rd.lvm.vg" /boot/loader/entries/ 2>/dev/null \
+         || grep -q "rd.lvm.vg" /boot/grub2/grub.cfg 2>/dev/null \
+         || grep -q "rd.lvm.vg" /boot/grub/grub.cfg 2>/dev/null; then LVM_OK=OK; else LVM_OK=MISSING; fi
     fi
     FSTAB_OK=OK
     grep -Eq "^[[:space:]]*/dev/sd" /etc/fstab && FSTAB_OK=BAD
@@ -254,11 +259,11 @@ fi
 phase "Prepare guest for NVMe and VERIFY (abort if not ready)"
 OSDISK=$(az vm show -g "$RG" -n "$VM" --query "storageProfile.osDisk.name" -o tsv)
 step "OS disk in use: $OSDISK"
-step "Rebuilding initramfs for ALL kernels (nvme+storvsc) and setting rd.lvm.lv / rd.auto"
+step "Rebuilding initramfs for ALL kernels (nvme+storvsc) and setting rd.lvm.vg / rd.auto"
 if [ "$DRYRUN" = 1 ]; then warn "[dry-run] skipping guest prep."; PREP_MSG="NVME_READY=YES"; else PREP_MSG=$(guest_prep_and_verify); fi
 printf '%s\n' "$PREP_MSG" | sed 's/^/        /'
 if grep -q "NVME_INITRAMFS=OK"  <<<"$PREP_MSG"; then ok "nvme present in NEWEST-kernel initramfs."; else bad "nvme MISSING from newest-kernel initramfs."; fi
-if grep -q "LVM_OK=OK"          <<<"$PREP_MSG"; then ok "rd.lvm.lv present (LVM root will auto-activate)."; else bad "rd.lvm.lv MISSING for LVM root."; fi
+if grep -q "LVM_OK=OK"          <<<"$PREP_MSG"; then ok "rd.lvm.vg present (whole VG activates: root + separate /usr,/var)."; else bad "rd.lvm.vg MISSING for LVM root."; fi
 if grep -q "FSTAB_OK=OK"        <<<"$PREP_MSG"; then ok "/etc/fstab uses UUIDs (no /dev/sdX)."; else bad "/etc/fstab references /dev/sdX - convert to UUID."; fi
 grep -q "NVME_READY=YES" <<<"$PREP_MSG" \
   && ok "GATE PASSED: guest is NVMe-ready." \
