@@ -34,37 +34,72 @@ for VM in "${!MAP[@]}"; do
   # 1) Prepare the guest OS for NVMe AND VERIFY it before touching the VM. This is the step
   #    that, if skipped or left unverified, leaves the VM UNBOOTABLE after the switch to NVMe
   #    (portal shows "running" but there is no SSH/console because the kernel cannot mount root).
-  #    We rebuild the initramfs with the nvme driver and set the GRUB timeout, then CHECK that
-  #    nvme is actually inside the initramfs and that /etc/fstab uses UUIDs. If the guest is not
-  #    NVMe-ready we ABORT for this VM (no deallocate) so it stays bootable on SCSI.
+  #    Handles BOTH Debian/Ubuntu (update-initramfs) and RHEL/SLES + LVM (dracut). It:
+  #      - rebuilds the initramfs for ALL installed kernels with the nvme drivers,
+  #      - adds nvme_core.io_timeout=240 and, when root is on LVM, rd.lvm.lv=<vg>/<lv>
+  #        (via grubby on RHEL/BLS, else /etc/default/grub) so the LVM root auto-activates,
+  #      - VERIFIES the NEWEST kernel's initramfs really contains nvme, that rd.lvm.lv is present
+  #        when root is LVM, and that /etc/fstab does not use /dev/sdX.
+  #    If not NVMe-ready we ABORT for this VM (no deallocate) so it stays bootable on SCSI.
   #    Windows / non-Linux: use Microsoft's Azure-NVMe-Conversion.ps1 instead.
-  # shellcheck disable=SC2016  # $(...) must run inside the guest, not expand locally
+  # shellcheck disable=SC2016  # $(...) and $VARs must run inside the guest, not expand locally
   PREP_MSG=$(az vm run-command invoke -g "$RG" -n "$VM" --command-id RunShellScript --scripts '
     set -e
-    if command -v update-initramfs >/dev/null 2>&1; then
+    # rebuild initramfs for ALL kernels with the nvme drivers
+    if command -v dracut >/dev/null 2>&1; then
+      echo "add_drivers+=\" nvme nvme_core \"" > /etc/dracut.conf.d/nvme.conf
+      dracut -f --regenerate-all --add-drivers "nvme nvme_core"
+    elif command -v update-initramfs >/dev/null 2>&1; then
       grep -q "^nvme" /etc/initramfs-tools/modules || echo nvme >> /etc/initramfs-tools/modules
       update-initramfs -u -k all
-    elif command -v dracut >/dev/null 2>&1; then
-      echo "add_drivers+=\" nvme \"" > /etc/dracut.conf.d/nvme.conf; dracut -f --regenerate-all
     fi
-    grep -q "nvme_core.io_timeout=240" /etc/default/grub || \
-      sed -i "s/\(GRUB_CMDLINE_LINUX=\"\)/\1nvme_core.io_timeout=240 /" /etc/default/grub
-    if command -v update-grub >/dev/null 2>&1; then update-grub; \
-    else grub2-mkconfig -o /boot/grub2/grub.cfg; fi
-    NVME_IN_INITRAMFS=no
+    # detect LVM root and build rd.lvm.lv=<vg>/<lv>
+    ROOT_SRC=$(findmnt -no SOURCE / || true)
+    RDLVM=""
+    if command -v lvs >/dev/null 2>&1 && lvs "$ROOT_SRC" >/dev/null 2>&1; then
+      VG=$(lvs --noheadings -o vg_name "$ROOT_SRC" | tr -d " ")
+      LV=$(lvs --noheadings -o lv_name "$ROOT_SRC" | tr -d " ")
+      RDLVM="rd.lvm.lv=${VG}/${LV}"
+    fi
+    ARGS="nvme_core.io_timeout=240 ${RDLVM}"
+    # apply kernel cmdline args (grubby for RHEL/BLS, else /etc/default/grub)
+    if command -v grubby >/dev/null 2>&1; then
+      grubby --update-kernel=ALL --args="$ARGS" || true
+    else
+      for a in $ARGS; do
+        grep -q "$a" /etc/default/grub || sed -i "s#\(GRUB_CMDLINE_LINUX=\"\)#\1$a #" /etc/default/grub
+      done
+      if command -v update-grub >/dev/null 2>&1; then update-grub
+      elif [ -d /boot/grub2 ]; then grub2-mkconfig -o /boot/grub2/grub.cfg; fi
+    fi
+    # VERIFY the NEWEST kernel initramfs actually contains nvme
     if command -v lsinitramfs >/dev/null 2>&1; then
-      lsinitramfs "/boot/initrd.img-$(uname -r)" 2>/dev/null | grep -q nvme && NVME_IN_INITRAMFS=yes
-    elif command -v lsinitrd >/dev/null 2>&1; then
-      lsinitrd 2>/dev/null | grep -q nvme && NVME_IN_INITRAMFS=yes
+      IMG=$(ls -1v /boot/initrd.img-* 2>/dev/null | tail -n1); LISTER=lsinitramfs
+    else
+      IMG=$(ls -1v /boot/initramfs-*.img 2>/dev/null | tail -n1); LISTER=lsinitrd
     fi
-    FSTAB_OK=yes
-    grep -Eq "^[[:space:]]*/dev/sd" /etc/fstab && FSTAB_OK=no
-    echo "NVME_IN_INITRAMFS=$NVME_IN_INITRAMFS"; echo "FSTAB_OK=$FSTAB_OK"
-    if [ "$NVME_IN_INITRAMFS" = yes ] && [ "$FSTAB_OK" = yes ]; then echo NVME_READY=YES; else echo NVME_READY=NO; fi
+    NVME_INITRAMFS=MISSING
+    [ -n "$IMG" ] && "$LISTER" "$IMG" 2>/dev/null | grep -q nvme && NVME_INITRAMFS=OK
+    # verify rd.lvm.lv is present when root is LVM
+    LVM_OK=OK
+    if [ -n "$RDLVM" ]; then
+      if grep -rq "rd.lvm.lv" /boot/loader/entries/ 2>/dev/null \
+         || grep -q "rd.lvm.lv" /boot/grub2/grub.cfg 2>/dev/null \
+         || grep -q "rd.lvm.lv" /boot/grub/grub.cfg 2>/dev/null; then LVM_OK=OK; else LVM_OK=MISSING; fi
+    fi
+    # fstab must not reference /dev/sdX
+    FSTAB_OK=OK
+    grep -Eq "^[[:space:]]*/dev/sd" /etc/fstab && FSTAB_OK=BAD
+    echo "KERNEL_IMG=$IMG"
+    echo "NVME_INITRAMFS=$NVME_INITRAMFS"
+    echo "RDLVM=${RDLVM:-none} LVM_OK=$LVM_OK"
+    echo "FSTAB_OK=$FSTAB_OK"
+    if [ "$NVME_INITRAMFS" = OK ] && [ "$LVM_OK" = OK ] && [ "$FSTAB_OK" = OK ]; then echo NVME_READY=YES; else echo NVME_READY=NO; fi
     ' --query "value[0].message" -o tsv 2>/dev/null || true)
   echo "$PREP_MSG"
   if ! grep -q "NVME_READY=YES" <<<"$PREP_MSG"; then
-    echo "    !! ABORT $VM: guest is NOT NVMe-ready (nvme missing from initramfs or /etc/fstab uses /dev/sdX)."
+    echo "    !! ABORT $VM: guest is NOT NVMe-ready (nvme missing from newest-kernel initramfs,"
+    echo "       rd.lvm.lv missing for an LVM root, or /etc/fstab uses /dev/sdX)."
     echo "       Remediate inside the guest, then re-run. The VM was NOT deallocated and stays bootable on SCSI."
     continue
   fi

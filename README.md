@@ -44,12 +44,17 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 > a `null_resource` + `az disk update`). Also prepare the **source** guest OS for NVMe (script
 > 02 step 1) *before* snapshotting, otherwise the new VM will not boot.
 >
-> **Guest verification is now enforced (scripts 02 / 02F):** step 1 rebuilds the initramfs with
-> the `nvme` driver, sets the GRUB timeout, then **verifies** that `nvme` is actually in the
-> initramfs and that `/etc/fstab` uses UUIDs. If the guest is not NVMe-ready the script **aborts
-> that VM without deallocating**, so it stays bootable on SCSI. Never skip or rush this step: a
-> VM converted to an NVMe-only v6 size with an unprepared guest boots to a stuck state (portal
-> shows *running*, but no SSH/console).
+> **Guest verification is now enforced (scripts 02 / 02F):** step 1 rebuilds the initramfs for
+> **all installed kernels** with the `nvme`/`nvme_core` drivers (`dracut -f --regenerate-all` on
+> RHEL/SLES, `update-initramfs -u -k all` on Debian/Ubuntu), sets `nvme_core.io_timeout=240`, and
+> — when the root is on **LVM** — adds `rd.lvm.lv=<vg>/<lv>` to the kernel cmdline (via `grubby`
+> on RHEL/BLS) so the LVM root auto-activates. It then **verifies** that the *newest* kernel's
+> initramfs really contains `nvme`, that `rd.lvm.lv` is present for LVM roots, and that
+> `/etc/fstab` uses UUIDs. If the guest is not NVMe-ready the script **aborts that VM without
+> deallocating**, so it stays bootable on SCSI. Never skip or rush this step: a VM converted to
+> an NVMe-only v6 size with an unprepared guest boots to a stuck state — on RHEL/LVM it drops to
+> a *dracut emergency shell* with `system-lv_root does not exist` (portal shows *running*, but no
+> SSH/console).
 >
 > **Rollback of an already-converted VM (script 99):** once a VM is on an NVMe-only v6 size, a
 > plain OS-disk *swap* back to the original SCSI disk is rejected
