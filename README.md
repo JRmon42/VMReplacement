@@ -14,6 +14,8 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 | 03 | `03-dsv2-bluegreen-to-v6.sh` | DS1_v2, DS11_v2 | **Blue/green** from snapshot (lowest service interruption) |
 | 02F | `02-upgrade-fsv2-inplace-to-v6.sh` | MID servers: F4s_v2 -> F4als_v6 / F8als_v6 | In-place **Gen1->Gen2 + NVMe** then resize to F-series v6 |
 | 03F | `03-fsv2-bluegreen-to-v6.sh` | MID servers: F4s_v2 -> F4als_v6 / F8als_v6 | **Blue/green** from snapshot (lowest service interruption) |
+| 02W | `02W-upgrade-fsv2-inplace-to-v6-windows.sh` / `.ps1` | **Windows** MID servers: F4s_v2 -> F4**ald**s_v6 / F8**ald**s_v6 | In-place **Gen2 + NVMe** resize to the local-temp-disk v6 twin |
+| 03W | `03W-fsv2-bluegreen-to-v6-windows.sh` | **Windows** MID servers: F4s_v2 -> F4als_v6 / F8als_v6 (no temp disk) | **Blue/green** rebuild (moves pagefile off `D:` first) |
 | 10 | `10-recover-and-upgrade.sh` | Any DSv2/Fsv2 -> v6 | **All-in-one**: rollback from a clean snapshot -> VERIFY SCSI boot -> hardened NVMe upgrade, with a printed banner per phase and PASS/FAIL per check |
 | 99 | `99-rollback.sh` | Any | Restore OS disk from a snapshot |
 
@@ -28,6 +30,17 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
   (`02-upgrade-fsv2-inplace-to-v6.sh`, keeps the same disk) or, for near-zero downtime +
   instant rollback, Script `03F` (`03-fsv2-bluegreen-to-v6.sh`). Enhanced (MfgTransNonProd)
   VMs target `Standard_F8als_v6`; standard VMs target `Standard_F4als_v6`.
+- **WINDOWS MID servers F4s_v2 -> F-series v6:** a *Windows* VM **cannot** resize between a size
+  **with** a local temp disk (`F4s_v2` has the `D:` drive) and one **without** (`F4als_v6` /
+  `F8als_v6` have none). It fails with *"changing from resource disk to non-resource disk VM size
+  and vice-versa is not allowed"* (https://aka.ms/AAah4sj). This is Windows-only (Linux may cross
+  the boundary, which is why 02F/03F use `F4als_v6`). Recommended: Script `02W`
+  (`02W-upgrade-fsv2-inplace-to-v6-windows.sh` / `.ps1`) which targets the **local-temp-disk twin**
+  `Standard_F4alds_v6` / `Standard_F8alds_v6` (same vCPU/RAM as the `als` size, Gen2 + NVMe, but
+  keeps a local NVMe `D:` for the pagefile) -- a "with temp disk -> with temp disk" resize that
+  Windows allows, keeping the same OS disk, name and IP. If you specifically need the diskless
+  `F4als_v6`, use Script `03W` (`03W-fsv2-bluegreen-to-v6-windows.sh`), which moves the pagefile
+  off `D:` then **rebuilds** the VM on the diskless size from the existing OS disk.
 
 > **In-place NVMe note (scripts 02 / 02F):** an older Gen1 OS disk does not advertise NVMe,
 > so a naive resize fails with *"Disk Controller Type property 'NVMe' is not supported by the
@@ -64,6 +77,16 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 > the `nvme` driver loads — identical dracut emergency shell. RHEL's **hostonly** initramfs drops
 > `pci_hyperv` when rebuilt on a SCSI VM (no vPCI device present at build time), which is why the
 > scripts **force-add** it and now gate on `PCI_HYPERV=OK`.
+>
+> **Windows resource-disk restriction (scripts 02W / 03W):** Azure blocks a *Windows* VM from
+> resizing between a "with local temp disk" size and a "without local temp disk" size in either
+> direction (`OperationNotAllowed ... resource disk to non-resource disk ... not allowed`,
+> https://aka.ms/AAah4sj). `F4s_v2` has a temp disk; `F4als_v6`/`F8als_v6` do not. `02W` therefore
+> targets the `alds` local-temp-disk twins (`F4alds_v6`/`F8alds_v6`) so the resize stays
+> "with-disk -> with-disk". Windows guest prep is minimal vs Linux: no initramfs -- WS2016+ ships
+> the in-box StorNVMe driver, and the scripts only ensure it is boot-start (`Start=0`) so the VM
+> boots on the NVMe controller. `03W` (diskless `als` target) additionally moves the pagefile off
+> `D:` to `C:` before rebuilding, since the diskless size removes the temp disk.
 >
 > **Rollback of an already-converted VM (script 99):** once a VM is on an NVMe-only v6 size, a
 > plain OS-disk *swap* back to the original SCSI disk is rejected
