@@ -14,6 +14,11 @@
 #   * v6 sizes (D2s_v6 / E2s_v6 ...) are NVMe-ONLY. If the OS initramfs that boots
 #     lacks the nvme driver, the root disk never appears -> dracut emergency shell
 #     ("system-lv_root does not exist").
+#   * On Azure Boost the NVMe controller is exposed on a synthetic Hyper-V vPCI bus.
+#     If the initramfs lacks pci_hyperv, the guest sees an EMPTY PCI bus, /dev/nvme0n1
+#     never appears (even though nvme is loaded) -> same dracut emergency shell. RHEL's
+#     hostonly initramfs drops pci_hyperv when rebuilt on a SCSI VM (no vPCI present at
+#     build time), so it MUST be force-added.
 #   * The rollback ALSO failed because its snapshot was taken AFTER the guest was
 #     edited, so the broken initramfs (missing LVM auto-activation) was baked in.
 #   -> Fix: roll back from a CLEAN pre-edit snapshot, PROVE it boots on SCSI, then
@@ -124,10 +129,12 @@ guest_prep_and_verify(){
   timeout 600 az vm run-command invoke -g "$RG" -n "$VM" --command-id RunShellScript --scripts '
     set -e
     if command -v dracut >/dev/null 2>&1; then
-      echo "add_drivers+=\" nvme nvme_core hv_storvsc \"" > /etc/dracut.conf.d/nvme.conf
-      dracut -f --regenerate-all --add-drivers "nvme nvme_core hv_storvsc"
+      echo "add_drivers+=\" nvme nvme_core pci_hyperv hv_vmbus hv_storvsc hv_netvsc hv_utils \"" > /etc/dracut.conf.d/nvme.conf
+      dracut -f --regenerate-all --add-drivers "nvme nvme_core pci_hyperv hv_vmbus hv_storvsc hv_netvsc hv_utils"
     elif command -v update-initramfs >/dev/null 2>&1; then
-      grep -q "^nvme" /etc/initramfs-tools/modules || echo nvme >> /etc/initramfs-tools/modules
+      for m in nvme nvme_core pci_hyperv hv_vmbus hv_storvsc hv_netvsc hv_utils; do
+        grep -q "^$m\$" /etc/initramfs-tools/modules || echo "$m" >> /etc/initramfs-tools/modules
+      done
       update-initramfs -u -k all
     fi
     ROOT_SRC=$(findmnt -no SOURCE / || true)
@@ -154,6 +161,11 @@ guest_prep_and_verify(){
     fi
     NVME_INITRAMFS=MISSING
     [ -n "$IMG" ] && "$LISTER" "$IMG" 2>/dev/null | grep -q nvme && NVME_INITRAMFS=OK
+    # pci_hyperv must be in the initramfs (module) OR built into the kernel; on Azure Boost the
+    # NVMe controller lives on a synthetic Hyper-V vPCI bus that only comes up with pci_hyperv.
+    PCI_HYPERV=MISSING
+    if [ -n "$IMG" ] && "$LISTER" "$IMG" 2>/dev/null | grep -q "pci-hyperv"; then PCI_HYPERV=OK
+    elif modinfo pci_hyperv 2>/dev/null | grep -qi "builtin"; then PCI_HYPERV=OK; fi
     LVM_OK=OK
     if [ -n "$RDLVM" ]; then
       if grep -rq "rd.lvm.vg" /boot/loader/entries/ 2>/dev/null \
@@ -164,9 +176,10 @@ guest_prep_and_verify(){
     grep -Eq "^[[:space:]]*/dev/sd" /etc/fstab && FSTAB_OK=BAD
     echo "KERNEL_IMG=$IMG"
     echo "NVME_INITRAMFS=$NVME_INITRAMFS"
+    echo "PCI_HYPERV=$PCI_HYPERV"
     echo "RDLVM=${RDLVM:-none} LVM_OK=$LVM_OK"
     echo "FSTAB_OK=$FSTAB_OK"
-    if [ "$NVME_INITRAMFS" = OK ] && [ "$LVM_OK" = OK ] && [ "$FSTAB_OK" = OK ]; then echo NVME_READY=YES; else echo NVME_READY=NO; fi
+    if [ "$NVME_INITRAMFS" = OK ] && [ "$PCI_HYPERV" = OK ] && [ "$LVM_OK" = OK ] && [ "$FSTAB_OK" = OK ]; then echo NVME_READY=YES; else echo NVME_READY=NO; fi
     ' --query "value[0].message" -o tsv 2>/dev/null || true
 }
 
@@ -259,10 +272,11 @@ fi
 phase "Prepare guest for NVMe and VERIFY (abort if not ready)"
 OSDISK=$(az vm show -g "$RG" -n "$VM" --query "storageProfile.osDisk.name" -o tsv)
 step "OS disk in use: $OSDISK"
-step "Rebuilding initramfs for ALL kernels (nvme+storvsc) and setting rd.lvm.vg / rd.auto"
+step "Rebuilding initramfs for ALL kernels (nvme + pci_hyperv + hv_*) and setting rd.lvm.vg / rd.auto"
 if [ "$DRYRUN" = 1 ]; then warn "[dry-run] skipping guest prep."; PREP_MSG="NVME_READY=YES"; else PREP_MSG=$(guest_prep_and_verify); fi
 printf '%s\n' "$PREP_MSG" | sed 's/^/        /'
 if grep -q "NVME_INITRAMFS=OK"  <<<"$PREP_MSG"; then ok "nvme present in NEWEST-kernel initramfs."; else bad "nvme MISSING from newest-kernel initramfs."; fi
+if grep -q "PCI_HYPERV=OK"      <<<"$PREP_MSG"; then ok "pci_hyperv present (Azure Boost NVMe vPCI bus will enumerate)."; else bad "pci_hyperv MISSING -> NVMe controller will NOT appear on the vPCI bus (empty PCI bus / dracut hang)."; fi
 if grep -q "LVM_OK=OK"          <<<"$PREP_MSG"; then ok "rd.lvm.vg present (whole VG activates: root + separate /usr,/var)."; else bad "rd.lvm.vg MISSING for LVM root."; fi
 if grep -q "FSTAB_OK=OK"        <<<"$PREP_MSG"; then ok "/etc/fstab uses UUIDs (no /dev/sdX)."; else bad "/etc/fstab references /dev/sdX - convert to UUID."; fi
 grep -q "NVME_READY=YES" <<<"$PREP_MSG" \

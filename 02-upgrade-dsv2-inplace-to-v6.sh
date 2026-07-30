@@ -42,11 +42,17 @@ for VM in "${!MAP[@]}"; do
   PREP_MSG=$(az vm run-command invoke -g "$RG" -n "$VM" --command-id RunShellScript --scripts '
     set -e
     # rebuild initramfs for ALL kernels with the nvme drivers
+    # pci_hyperv is MANDATORY: on Azure Boost the NVMe controller is exposed on a
+    # synthetic Hyper-V vPCI bus; without pci_hyperv the guest sees an empty PCI bus,
+    # /dev/nvme0n1 never appears and the VM drops to a dracut emergency shell.
+    DRIVERS="nvme nvme_core pci_hyperv hv_vmbus hv_storvsc hv_netvsc hv_utils"
     if command -v dracut >/dev/null 2>&1; then
-      echo "add_drivers+=\" nvme nvme_core \"" > /etc/dracut.conf.d/nvme.conf
-      dracut -f --regenerate-all --add-drivers "nvme nvme_core"
+      echo "add_drivers+=\" $DRIVERS \"" > /etc/dracut.conf.d/nvme.conf
+      dracut -f --regenerate-all --add-drivers "$DRIVERS"
     elif command -v update-initramfs >/dev/null 2>&1; then
-      grep -q "^nvme" /etc/initramfs-tools/modules || echo nvme >> /etc/initramfs-tools/modules
+      for m in $DRIVERS; do
+        grep -q "^$m\$" /etc/initramfs-tools/modules || echo "$m" >> /etc/initramfs-tools/modules
+      done
       update-initramfs -u -k all
     fi
     # detect LVM root VG and activate the WHOLE VG (rd.lvm.vg) so a separate /usr,/var LV also activates
@@ -76,6 +82,11 @@ for VM in "${!MAP[@]}"; do
     fi
     NVME_INITRAMFS=MISSING
     [ -n "$IMG" ] && "$LISTER" "$IMG" 2>/dev/null | grep -q nvme && NVME_INITRAMFS=OK
+    # pci_hyperv must be in the initramfs (module) OR built into the kernel; otherwise the
+    # Azure Boost NVMe controller never enumerates on the vPCI bus.
+    PCI_HYPERV=MISSING
+    if [ -n "$IMG" ] && "$LISTER" "$IMG" 2>/dev/null | grep -q "pci-hyperv"; then PCI_HYPERV=OK
+    elif modinfo pci_hyperv 2>/dev/null | grep -qi "builtin"; then PCI_HYPERV=OK; fi
     # verify rd.lvm.vg is present when root is LVM
     LVM_OK=OK
     if [ -n "$RDLVM" ]; then
@@ -88,14 +99,15 @@ for VM in "${!MAP[@]}"; do
     grep -Eq "^[[:space:]]*/dev/sd" /etc/fstab && FSTAB_OK=BAD
     echo "KERNEL_IMG=$IMG"
     echo "NVME_INITRAMFS=$NVME_INITRAMFS"
+    echo "PCI_HYPERV=$PCI_HYPERV"
     echo "RDLVM=${RDLVM:-none} LVM_OK=$LVM_OK"
     echo "FSTAB_OK=$FSTAB_OK"
-    if [ "$NVME_INITRAMFS" = OK ] && [ "$LVM_OK" = OK ] && [ "$FSTAB_OK" = OK ]; then echo NVME_READY=YES; else echo NVME_READY=NO; fi
+    if [ "$NVME_INITRAMFS" = OK ] && [ "$PCI_HYPERV" = OK ] && [ "$LVM_OK" = OK ] && [ "$FSTAB_OK" = OK ]; then echo NVME_READY=YES; else echo NVME_READY=NO; fi
     ' --query "value[0].message" -o tsv 2>/dev/null || true)
   echo "$PREP_MSG"
   if ! grep -q "NVME_READY=YES" <<<"$PREP_MSG"; then
-    echo "    !! ABORT $VM: guest is NOT NVMe-ready (nvme missing from newest-kernel initramfs,"
-    echo "       rd.lvm.vg missing for an LVM root, or /etc/fstab uses /dev/sdX)."
+    echo "    !! ABORT $VM: guest is NOT NVMe-ready (nvme or pci_hyperv missing from newest-kernel"
+    echo "       initramfs, rd.lvm.vg missing for an LVM root, or /etc/fstab uses /dev/sdX)."
     echo "       Remediate inside the guest, then re-run. The VM was NOT deallocated and stays bootable on SCSI."
     continue
   fi

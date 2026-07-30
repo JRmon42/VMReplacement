@@ -46,16 +46,24 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 > 02 step 1) *before* snapshotting, otherwise the new VM will not boot.
 >
 > **Guest verification is now enforced (scripts 02 / 02F):** step 1 rebuilds the initramfs for
-> **all installed kernels** with the `nvme`/`nvme_core` drivers (`dracut -f --regenerate-all` on
-> RHEL/SLES, `update-initramfs -u -k all` on Debian/Ubuntu), sets `nvme_core.io_timeout=240`, and
-> — when the root is on **LVM** — adds `rd.lvm.lv=<vg>/<lv>` to the kernel cmdline (via `grubby`
-> on RHEL/BLS) so the LVM root auto-activates. It then **verifies** that the *newest* kernel's
-> initramfs really contains `nvme`, that `rd.lvm.lv` is present for LVM roots, and that
-> `/etc/fstab` uses UUIDs. If the guest is not NVMe-ready the script **aborts that VM without
-> deallocating**, so it stays bootable on SCSI. Never skip or rush this step: a VM converted to
-> an NVMe-only v6 size with an unprepared guest boots to a stuck state — on RHEL/LVM it drops to
-> a *dracut emergency shell* with `system-lv_root does not exist` (portal shows *running*, but no
-> SSH/console).
+> **all installed kernels** with the `nvme nvme_core pci_hyperv hv_vmbus hv_storvsc hv_netvsc
+> hv_utils` drivers (`dracut -f --regenerate-all` on RHEL/SLES, `update-initramfs -u -k all` on
+> Debian/Ubuntu), sets `nvme_core.io_timeout=240`, and — when the root is on **LVM** — adds
+> `rd.lvm.vg=<vg>` (the **whole** root VG, so a separate `/usr` or `/var` LV also activates) to the
+> kernel cmdline via `grubby` on RHEL/BLS. It then **verifies** that the *newest* kernel's
+> initramfs really contains `nvme` **and `pci_hyperv`**, that `rd.lvm.vg` is present for LVM roots,
+> and that `/etc/fstab` uses UUIDs. If the guest is not NVMe-ready the script **aborts that VM
+> without deallocating**, so it stays bootable on SCSI. Never skip or rush this step: a VM
+> converted to an NVMe-only v6 size with an unprepared guest boots to a stuck state — on RHEL/LVM
+> it drops to a *dracut emergency shell* with `system-lv_root does not exist` (portal shows
+> *running*, but no SSH/console).
+>
+> **`pci_hyperv` is mandatory (Azure Boost vPCI):** on v6 sizes the remote NVMe disk is exposed
+> through a *synthetic Hyper-V vPCI bus*. Without `pci_hyperv` in the initramfs the guest sees an
+> **empty PCI bus** (`/sys/bus/pci/devices/` empty), so `/dev/nvme0n1` never appears even though
+> the `nvme` driver loads — identical dracut emergency shell. RHEL's **hostonly** initramfs drops
+> `pci_hyperv` when rebuilt on a SCSI VM (no vPCI device present at build time), which is why the
+> scripts **force-add** it and now gate on `PCI_HYPERV=OK`.
 >
 > **Rollback of an already-converted VM (script 99):** once a VM is on an NVMe-only v6 size, a
 > plain OS-disk *swap* back to the original SCSI disk is rejected
@@ -74,10 +82,10 @@ single, fully-instrumented run. Every phase prints a `==> PHASE` banner and ever
 `[  OK  ]` / `[ FAIL ]` with the observed value, so you always know where you are.
 
 Flow: **rollback** from a *clean pre-edit* snapshot -> **verify** it boots on SCSI ->
-**prep+verify** the guest (nvme in newest-kernel initramfs, `rd.lvm.lv`, fstab UUID; aborts if
-not ready, VM stays on SCSI) -> **proof reboot** on SCSI with the rebuilt initramfs ->
-**convert** to the v6 size + NVMe in one atomic update -> **verify** the NVMe boot (auto-suggests
-rollback if it fails).
+**prep+verify** the guest (nvme **and pci_hyperv** in newest-kernel initramfs, `rd.lvm.vg`, fstab
+UUID; aborts if not ready, VM stays on SCSI) -> **proof reboot** on SCSI with the rebuilt
+initramfs -> **convert** to the v6 size + NVMe in one atomic update -> **verify** the NVMe boot
+(auto-suggests rollback if it fails).
 
 ```bash
 # one line:
