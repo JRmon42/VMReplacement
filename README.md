@@ -83,10 +83,20 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 > direction (`OperationNotAllowed ... resource disk to non-resource disk ... not allowed`,
 > https://aka.ms/AAah4sj). `F4s_v2` has a temp disk; `F4als_v6`/`F8als_v6` do not. `02W` therefore
 > targets the `alds` local-temp-disk twins (`F4alds_v6`/`F8alds_v6`) so the resize stays
-> "with-disk -> with-disk". Windows guest prep is minimal vs Linux: no initramfs -- WS2016+ ships
-> the in-box StorNVMe driver, and the scripts only ensure it is boot-start (`Start=0`) so the VM
-> boots on the NVMe controller. `03W` (diskless `als` target) additionally moves the pagefile off
-> `D:` to `C:` before rebuilding, since the diskless size removes the temp disk.
+> "with-disk -> with-disk".
+>
+> **Windows Gen1 -> Gen2 needs MBR2GPT IN-GUEST (scripts 02W / 03W):** v6 sizes are **Gen2/UEFI +
+> NVMe only**. A Gen1 Windows OS disk is **MBR/BIOS** and will *not* boot on a Gen2 VM — the portal
+> **"Swap OS Disk"** even greys the Gen1 disk out with *"Disk generation is not compatible with VM
+> generation"*. Azure does **not** convert the boot layout for you: you must run the in-box
+> **`mbr2gpt /convert /allowFullOS`** inside the running Gen1 guest first (adds the EFI system
+> partition), *then* `az vm update --security-type TrustedLaunch` flips the VM to Gen2/UEFI. The
+> 02W/03W guest-prep now does this automatically (validate → defrag → convert), plus sets StorNVMe
+> boot-start. Caveats: **Windows Server 2016 has no MBR2GPT** (upgrade the guest to 2019/2022
+> first), **disable BitLocker** before converting, you **cannot extend the system volume after**
+> conversion, and a VM converted to Trusted Launch/Gen2 **cannot be rolled back to Gen1** except by
+> restoring the pre-conversion snapshot. Do **not** try to build a fresh marketplace Gen2 v6 VM and
+> *swap in* the untouched Gen1 disk — that path is blocked by the generation mismatch.
 >
 > **Rollback of an already-converted VM (script 99):** once a VM is on an NVMe-only v6 size, a
 > plain OS-disk *swap* back to the original SCSI disk is rejected

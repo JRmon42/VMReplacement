@@ -34,6 +34,23 @@ PREP_MSG=$(az vm run-command invoke -g "$RG" -n "$SRC_VM" --command-id RunPowerS
     Set-WmiInstance -Class Win32_PageFileSetting -Arguments @{Name="C:\pagefile.sys"; InitialSize=0; MaximumSize=0} | Out-Null
   }
   Write-Output "PAGEFILE=C_only"
+  # Gen1(MBR/BIOS) -> GPT/EFI on the SOURCE before snapshotting: a Gen1 (MBR) disk relabelled V2
+  # will NOT boot as Gen2/UEFI. Convert with in-box MBR2GPT (WS2016 unsupported; disable BitLocker).
+  $fw = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name PEFirmwareType -ErrorAction SilentlyContinue).PEFirmwareType
+  if ($fw -eq 2) { Write-Output "MBR2GPT=ALREADY_GPT" }
+  else {
+    $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+    if ($bl -and $bl.ProtectionStatus -eq "On") { Write-Output "MBR2GPT=BITLOCKER_ON" }
+    else {
+      Defrag C: /U 2>&1 | Out-Null
+      & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1 | Out-Null
+      if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=VALIDATE_FAIL" }
+      else {
+        & "$env:SystemRoot\System32\mbr2gpt.exe" /convert /allowFullOS 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=CONVERT_FAIL" } else { Write-Output "MBR2GPT=CONVERTED" }
+      }
+    }
+  }
   # Ensure StorNVMe is boot-start so the rebuilt VM boots on the NVMe controller.
   $svc = "HKLM:\SYSTEM\CurrentControlSet\Services\stornvme"
   if (Test-Path $svc) {
@@ -42,9 +59,12 @@ PREP_MSG=$(az vm run-command invoke -g "$RG" -n "$SRC_VM" --command-id RunPowerS
   } else { Write-Output "NVME_READY=NO" }
 ' --query "value[0].message" -o tsv 2>/dev/null || true)
 echo "$PREP_MSG"
-grep -q "NVME_READY=YES" <<<"$PREP_MSG" || { echo "    !! ABORT: StorNVMe missing/not boot-start (need WS2016+)."; exit 1; }
-echo "    NOTE: reboot '$SRC_VM' once so the pagefile change takes effect BEFORE snapshotting, if you"
-echo "          have not already snapshotted a pagefile-on-C: state."
+if grep -qE "MBR2GPT=(BITLOCKER_ON|VALIDATE_FAIL|CONVERT_FAIL)" <<<"$PREP_MSG"; then
+  echo "    !! ABORT: Gen1->Gen2 (MBR2GPT) failed (disable BitLocker / WS2016 unsupported / defrag needed)."; exit 1
+fi
+grep -q "NVME_READY=YES" <<<"$PREP_MSG" || { echo "    !! ABORT: StorNVMe missing/not boot-start (need WS2019+)."; exit 1; }
+echo "    NOTE: reboot '$SRC_VM' once so the pagefile + GPT/EFI changes take effect and RE-SNAPSHOT"
+echo "          AFTER the conversion, so OS_SNAPSHOT below captures the GPT/EFI + pagefile-on-C: state."
 
 echo "==> Creating Gen2/NVMe OS disk from snapshot $OS_SNAPSHOT"
 SNAP_ID=$(az snapshot show -g "$RG" -n "$OS_SNAPSHOT" --query id -o tsv)

@@ -39,43 +39,69 @@ for VM in "${!MAP[@]}"; do
   az snapshot create -g "$RG" -n "${VM}-os-$(date +%Y%m%d-%H%M%S)" \
       --source "$OSDISK_ID" --incremental true -o none
 
-  # 1) Prepare + VERIFY the Windows guest for NVMe BEFORE touching the VM. Unlike Linux there is
-  #    no initramfs to rebuild: Windows Server 2016+ ships the in-box StorNVMe driver. The only
-  #    requirement is that StorNVMe is a BOOT-START driver (Start=0) so Windows can boot from the
-  #    NVMe controller. We set it if needed and abort if the driver is absent (older OS). Because
-  #    the target KEEPS a local temp disk, the pagefile on D: does NOT need to be moved.
+  # 1) Prepare + VERIFY the Windows guest BEFORE touching the VM. Two things are required:
+  #    (a) Gen1 -> Gen2 boot conversion: a Gen1 Windows OS disk is MBR/BIOS, but v6 sizes are
+  #        Gen2/UEFI-only. The guest OS volume must be converted MBR->GPT (+ EFI system partition)
+  #        with the in-box MBR2GPT.exe *while still running on the Gen1 VM*. Azure does NOT do this
+  #        automatically -- the later 'az vm update --security-type TrustedLaunch' only flips the
+  #        VM to Gen2/UEFI and REQUIRES the disk to already be GPT/EFI, otherwise it will not boot.
+  #        (Windows Server 2016 has no MBR2GPT -> upgrade the guest to 2019/2022 first.)
+  #        Disable BitLocker before conversion; you cannot extend the system volume afterwards.
+  #    (b) NVMe boot: Windows Server 2019+ ships the in-box StorNVMe driver; it must be BOOT-START
+  #        (Start=0) so Windows boots on the NVMe controller.
+  #    IMPORTANT: once converted to Trusted Launch/Gen2 a VM cannot be rolled back to Gen1 except by
+  #    restoring the step-0 snapshot -- so the snapshot above is mandatory.
   # shellcheck disable=SC2016  # the PowerShell must run inside the guest, not expand locally
   PREP_MSG=$(az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts '
     $ErrorActionPreference = "Stop"
+    Write-Output ("OS=" + (Get-CimInstance Win32_OperatingSystem).Caption)
+    # (a) Gen1(MBR/BIOS) -> GPT/EFI conversion, only if the guest is not already UEFI/GPT.
+    $fw = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name PEFirmwareType -ErrorAction SilentlyContinue).PEFirmwareType
+    if ($fw -eq 2) {
+      Write-Output "MBR2GPT=ALREADY_GPT"
+    } else {
+      $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+      if ($bl -and $bl.ProtectionStatus -eq "On") { Write-Output "MBR2GPT=BITLOCKER_ON" }
+      else {
+        Defrag C: /U 2>&1 | Out-Null
+        & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=VALIDATE_FAIL" }
+        else {
+          & "$env:SystemRoot\System32\mbr2gpt.exe" /convert /allowFullOS 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=CONVERT_FAIL" } else { Write-Output "MBR2GPT=CONVERTED" }
+        }
+      }
+    }
+    # (b) StorNVMe must be boot-start.
     $svc = "HKLM:\SYSTEM\CurrentControlSet\Services\stornvme"
     if (Test-Path $svc) {
-      $start = (Get-ItemProperty -Path $svc -Name Start -ErrorAction SilentlyContinue).Start
-      if ($start -ne 0) {
-        Set-ItemProperty -Path $svc -Name Start -Value 0
-        Write-Output "STORNVME=SET_BOOT"
-      } else {
-        Write-Output "STORNVME=OK"
-      }
-    } else {
-      Write-Output "STORNVME=MISSING"
-    }
-    $fw = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name PEFirmwareType -ErrorAction SilentlyContinue).PEFirmwareType
-    Write-Output ("FIRMWARE=" + $(if ($fw -eq 2) {"UEFI"} elseif ($fw -eq 1) {"BIOS"} else {"UNKNOWN"}))
-    Write-Output ("OS=" + (Get-CimInstance Win32_OperatingSystem).Caption)
-    if ((Test-Path $svc) -and ((Get-ItemProperty -Path $svc -Name Start).Start -eq 0)) { Write-Output "NVME_READY=YES" } else { Write-Output "NVME_READY=NO" }
+      if ((Get-ItemProperty -Path $svc -Name Start).Start -ne 0) { Set-ItemProperty -Path $svc -Name Start -Value 0 }
+      Write-Output "STORNVME=OK"
+    } else { Write-Output "STORNVME=MISSING" }
+    $ok = ((Test-Path $svc) -and ((Get-ItemProperty -Path $svc -Name Start).Start -eq 0))
+    Write-Output ("READY=" + $(if ($ok) {"YES"} else {"NO"}))
   ' --query "value[0].message" -o tsv 2>/dev/null || true)
   echo "$PREP_MSG"
-  if ! grep -q "NVME_READY=YES" <<<"$PREP_MSG"; then
-    echo "    !! ABORT $VM: StorNVMe driver missing/not boot-start. Use a WS2016+ image or install"
+  if grep -qE "MBR2GPT=(BITLOCKER_ON|VALIDATE_FAIL|CONVERT_FAIL)" <<<"$PREP_MSG"; then
+    echo "    !! ABORT $VM: Gen1->Gen2 (MBR2GPT) prerequisite failed."
+    echo "       - BITLOCKER_ON: disable BitLocker on C:, then re-run."
+    echo "       - VALIDATE_FAIL: WS2016 has no MBR2GPT (upgrade guest to 2019/2022), or free space"
+    echo "         at end of the system partition (run 'Defrag C: /U /V'), then re-run."
+    echo "       The VM was NOT deallocated (stays bootable on Gen1/SCSI)."
+    continue
+  fi
+  if ! grep -q "READY=YES" <<<"$PREP_MSG"; then
+    echo "    !! ABORT $VM: StorNVMe driver missing/not boot-start. Use a WS2019+ image or install"
     echo "       the in-box NVMe driver, then re-run. The VM was NOT deallocated (stays on SCSI)."
     continue
   fi
 
-  # 2) Deallocate (the disk-controller type cannot change on a running VM):
+  # 2) Deallocate (the disk-controller type / generation cannot change on a running VM):
   az vm deallocate -g "$RG" -n "$VM" -o none
 
-  # 3) Convert Gen1 -> Trusted Launch / Gen2 IN PLACE if not already Gen2 (no disk rebuild).
-  #    If the VM/disk is already Gen2 this is a no-op; failures here are non-fatal (already Gen2).
+  # 3) Convert Gen1 -> Trusted Launch / Gen2 IN PLACE if not already Gen2 (no disk rebuild). The
+  #    guest was already made GPT/EFI in step 1, so this UEFI flip boots cleanly. Once done the VM
+  #    CANNOT be rolled back to Gen1 except by restoring the step-0 snapshot.
   GEN=$(az disk show -g "$RG" -n "$OSDISK" --query hyperVGeneration -o tsv 2>/dev/null || echo "")
   if [[ "$GEN" != "V2" ]]; then
     az vm update -g "$RG" -n "$VM" --security-type TrustedLaunch \
