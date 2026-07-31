@@ -17,6 +17,7 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 | 02W | `02W-upgrade-fsv2-inplace-to-v6-windows.sh` / `.ps1` | **Windows** MID servers: F4s_v2 -> F4**ald**s_v6 / F8**ald**s_v6 | In-place **Gen2 + NVMe** resize to the local-temp-disk v6 twin |
 | 03W | `03W-fsv2-bluegreen-to-v6-windows.sh` | **Windows** MID servers: F4s_v2 -> F4als_v6 / F8als_v6 (no temp disk) | **Blue/green** rebuild (moves pagefile off `D:` first) |
 | diagW | `diag-windows-v6-readiness.sh` | **Windows** F4s_v2 -> v6 | **READ-ONLY** readiness check (gen, firmware/GPT, BitLocker, StorNVMe, OS) |
+| 11W | `11W-teams-guided-recover-and-migrate-windows.sh` | **Windows** F4s_v2 -> v6 | **Guided, gated** rollback-then-migrate for a live Teams session (per-step [OK]/[FAIL], pauses between steps) |
 | 10 | `10-recover-and-upgrade.sh` | Any DSv2/Fsv2 -> v6 | **All-in-one**: rollback from a clean snapshot -> VERIFY SCSI boot -> hardened NVMe upgrade, with a printed banner per phase and PASS/FAIL per check |
 | 99 | `99-rollback.sh` | Any | Restore OS disk from a snapshot |
 
