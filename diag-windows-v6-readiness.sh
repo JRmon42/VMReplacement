@@ -33,6 +33,27 @@ else
 fi
 
 echo
+echo "--- [2b] Target v6 SKU availability + preview feature flags (control-plane) ---"
+# The local-temp-disk 'alds_v6' sizes (Fadsv6 / FALDV6Series) may be behind a PREVIEW feature flag
+# in some subscriptions: 'not available to the current subscription ... feature flags registered:
+# Microsoft.Compute/FALDV6Series'. That is NOT a quota error. Check availability + registration.
+LOC=$(az vm show -g "$RG" -n "$VM" --query location -o tsv 2>/dev/null || echo "")
+TARGET="${TARGET:-Standard_F4alds_v6}"
+if [[ -n "$LOC" ]]; then
+  echo "    location = $LOC   target = $TARGET"
+  AVAIL=$(az vm list-skus -l "$LOC" --size "${TARGET#Standard_}" --query "[?name=='$TARGET'] | length(@)" -o tsv 2>/dev/null || echo "0")
+  if [[ "${AVAIL:-0}" != "0" ]]; then
+    echo "    SKU_AVAILABLE     = yes ('$TARGET' is offered to this subscription in $LOC)"
+  else
+    echo "    SKU_AVAILABLE     = NO  ('$TARGET' NOT offered here -> preview flag and/or region issue, NOT quota)"
+  fi
+fi
+for F in FALDV6Series FADSV6Series; do
+  ST=$(az feature show --namespace Microsoft.Compute --name "$F" --query properties.state -o tsv 2>/dev/null || echo "n/a")
+  echo "    FEATURE $F = $ST   (want 'Registered'; register with: az feature register --namespace Microsoft.Compute --name $F)"
+done
+
+echo
 echo "--- [3] IN-GUEST checks (firmware, partition style, BitLocker, StorNVMe, OS, pagefile) ---"
 echo "    Requires the VM to be RUNNING with the guest agent healthy."
 # shellcheck disable=SC2016  # the PowerShell must run inside the guest, not expand locally
@@ -69,6 +90,10 @@ echo "    Fix: disable BitLocker, then in the guest run:"
 echo "         mbr2gpt /validate /allowFullOS  &&  mbr2gpt /convert /allowFullOS"
 echo "    (Windows Server 2016 has NO mbr2gpt -> upgrade guest to 2019/2022 first.)"
 echo "  * ctrl without NVMe  -> tag the disk: az disk update ... diskControllerTypes='SCSI, NVMe'"
+echo "  * SKU_AVAILABLE=NO / FEATURE ... != Registered  -> the target size is PREVIEW-gated (NOT quota)."
+echo "    Fix: az feature register --namespace Microsoft.Compute --name FALDV6Series ; wait for 'Registered';"
+echo "         then az provider register --namespace Microsoft.Compute.  Or use the diskless 'als_v6' via"
+echo "         blue/green rebuild (03W) since 'als_v6' is already available to this subscription."
 echo "  * STORNVME_START != 0 -> set it to 0 so Windows boots on the NVMe controller."
 echo "  Once FIRMWARE=UEFI, BitLocker Off and STORNVME_START=0, run 02W to finish the upgrade."
 echo "==================================================================="
