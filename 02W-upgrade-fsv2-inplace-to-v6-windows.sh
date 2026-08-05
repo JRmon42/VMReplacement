@@ -32,6 +32,17 @@ for VM in "${!MAP[@]}"; do
   TARGET="${MAP[$VM]}"
   echo "==> $VM -> $TARGET (Windows, Gen2 + NVMe, local-temp-disk variant)"
 
+  # GUARD: on Windows you cannot resize F4s_v2 (has D: temp disk) to a NO-temp-disk 'als_v6'
+  # size -- Azure returns OperationNotAllowed "resource disk to non-resource disk ... not allowed"
+  # (https://aka.ms/AAah4sj). Reject that target and point at the local-temp-disk 'alds_v6' twin.
+  if [[ "$TARGET" =~ als_v6$ && ! "$TARGET" =~ alds_v6$ ]]; then
+    SUGGEST="${TARGET/als_v6/alds_v6}"
+    echo "    !! SKIP $VM: '$TARGET' has NO local temp disk; a Windows resize from F4s_v2 (which has"
+    echo "       a D: temp disk) to it is blocked. Use the temp-disk twin '$SUGGEST' instead, or the"
+    echo "       blue/green rebuild path (03W) if you specifically need the diskless '$TARGET'."
+    continue
+  fi
+
   OSDISK=$(az vm show -g "$RG" -n "$VM" --query "storageProfile.osDisk.name" -o tsv)
   OSDISK_ID=$(az vm show -g "$RG" -n "$VM" --query "storageProfile.osDisk.managedDisk.id" -o tsv)
 

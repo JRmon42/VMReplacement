@@ -118,6 +118,11 @@ command -v az >/dev/null 2>&1 || die "azure-cli (az) not found. Use Azure Cloud 
 az account show >/dev/null 2>&1 || die "Not logged in. Run: az login  (or open Azure Cloud Shell)."
 ok "Subscription: $(az account show --query name -o tsv 2>/dev/null)"
 case "$MODE" in full|rollback-only|migrate-only) ok "Mode: $MODE   Target size: $TARGET_SIZE   Rollback size: $ROLLBACK_SIZE";; *) die "Unknown MODE='$MODE' (use full|rollback-only|migrate-only)";; esac
+# GUARD: reject a Windows NO-temp-disk 'als_v6' target (the mistake that keeps triggering
+# OperationNotAllowed "resource disk to non-resource disk ... not allowed", https://aka.ms/AAah4sj).
+if [ "$MODE" != rollback-only ] && [[ "$TARGET_SIZE" =~ als_v6$ && ! "$TARGET_SIZE" =~ alds_v6$ ]]; then
+  die "TARGET_SIZE='$TARGET_SIZE' has NO local temp disk." "F4s_v2 has a D: temp disk, so a Windows in-place resize to a diskless 'als_v6' size is blocked by Azure. Use the temp-disk twin '${TARGET_SIZE/als_v6/alds_v6}' (recommended), or the blue/green rebuild (03W) if you specifically need the diskless '$TARGET_SIZE'."
+fi
 [ "$DRYRUN" = 1 ] && warn "DRYRUN=1 - state-changing commands are printed, not executed."
 
 az vm show -g "$RG" -n "$VM" >/dev/null 2>&1 && VM_EXISTS=1 || VM_EXISTS=0

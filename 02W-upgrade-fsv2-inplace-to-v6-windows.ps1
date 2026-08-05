@@ -28,6 +28,14 @@ foreach ($vm in $Map.Keys) {
   $target = $Map[$vm]
   Write-Host "==> $vm -> $target (Windows, Gen2 + NVMe, local-temp-disk variant)"
 
+  # GUARD: a Windows resize from F4s_v2 (has D: temp disk) to a NO-temp-disk 'als_v6' size is
+  # blocked by Azure (OperationNotAllowed, https://aka.ms/AAah4sj). Reject it and suggest the twin.
+  if ($target -match 'als_v6$' -and $target -notmatch 'alds_v6$') {
+    $suggest = $target -replace 'als_v6$', 'alds_v6'
+    Write-Warning "    SKIP $vm: '$target' has NO local temp disk; a Windows resize from F4s_v2 is blocked. Use the temp-disk twin '$suggest' (or 03W blue/green for the diskless '$target')."
+    continue
+  }
+
   $v      = Get-AzVM -ResourceGroupName $RG -Name $vm
   $osName = $v.StorageProfile.OsDisk.Name
   $osDisk = Get-AzDisk -ResourceGroupName $RG -DiskName $osName
