@@ -185,6 +185,13 @@ else
   OSID=$(az vm show -g "$RG" -n "$VM" --query "storageProfile.osDisk.managedDisk.id" -o tsv 2>/dev/null)
   step "Creating incremental snapshot '$SNAPSHOT' from the current OS disk..."
   run az snapshot create -g "$RG" -n "$SNAPSHOT" --source "$OSID" --incremental true -o none
+  # VERIFY the snapshot actually exists - 'az snapshot create' can print an error (e.g.
+  # AuthorizationFailed: missing Microsoft.Compute/snapshots/write) yet the script must NOT
+  # proceed without a real rollback point.
+  if [ "$DRYRUN" != 1 ]; then
+    az snapshot show -g "$RG" -n "$SNAPSHOT" >/dev/null 2>&1 \
+      || die "Safety snapshot was NOT created (see the error above)." "This is usually a missing permission ('Microsoft.Compute/snapshots/write'). We must have a rollback point before migrating - do NOT proceed. Either (a) ask someone with rights to create a snapshot and re-run with SNAPSHOT=<name>, or (b) have the subscription owner grant Contributor / Disk Snapshot Contributor on the resource group."
+  fi
   ok "Safety snapshot created: $SNAPSHOT"
 fi
 warn "ROLLBACK POINT: keep this snapshot name -> $SNAPSHOT"
@@ -299,7 +306,12 @@ confirm "Disk NVMe-capable confirmed. Proceed to REBUILD the VM on $TARGET_SIZE?
 phase "Rebuild the VM on $TARGET_SIZE from the SAME OS disk + SAME NIC (keeps name & IP)"
 warn "This deletes the VM object and recreates it. The OS disk '$OSDISK' and NIC are RETAINED."
 step "Deleting the VM object '$VM' (OS disk + NIC kept, private IP preserved)..."
-run az vm delete -g "$RG" -n "$VM" --yes -o none
+run az vm delete -g "$RG" -n "$VM" --yes -o none \
+  || die "Could not delete the VM object (needed to rebuild on the new size)." "Usually a missing permission ('Microsoft.Compute/virtualMachines/delete'). The OS disk and NIC are untouched; nothing was lost. Ask the subscription owner to grant Contributor on the resource group, then re-run."
+if [ "$DRYRUN" != 1 ]; then
+  az vm show -g "$RG" -n "$VM" >/dev/null 2>&1 \
+    && die "The VM object still exists after the delete call (delete did not take)." "Check permissions/locks on '$VM'. The OS disk and NIC are retained; nothing was lost."
+fi
 step "Recreating '$VM' on $TARGET_SIZE (Gen2/NVMe) attaching the same OS disk + NIC..."
 # shellcheck disable=SC2086  # ZONE must word-split into an optional flag (empty => omitted)
 run az vm create -g "$RG" -n "$VM" --size "$TARGET_SIZE" --location "$LOCATION" \
