@@ -34,9 +34,11 @@ fi
 
 echo
 echo "--- [2b] Target v6 SKU availability + preview feature flags (control-plane) ---"
-# The local-temp-disk 'alds_v6' sizes (Fadsv6 / FALDV6Series) may be behind a PREVIEW feature flag
-# in some subscriptions: 'not available to the current subscription ... feature flags registered:
-# Microsoft.Compute/FALDV6Series'. That is NOT a quota error. Check availability + registration.
+# The local-temp-disk 'alds_v6' sizes (Fadsv6 / FALDV6Series) are a RESTRICTED/allowlist preview
+# in most subscriptions and CANNOT be self-registered: 'az feature register ... FALDV6Series'
+# returns FeatureRegistrationUnsupported ('does not support registration'). That is NOT a quota
+# error and NOT something the subscription owner can fix -- access must be granted by Microsoft.
+# The diskless 'als_v6' (Falsv6) family, by contrast, is GA and usually already available.
 LOC=$(az vm show -g "$RG" -n "$VM" --query location -o tsv 2>/dev/null || echo "")
 TARGET="${TARGET:-Standard_F4alds_v6}"
 if [[ -n "$LOC" ]]; then
@@ -50,7 +52,8 @@ if [[ -n "$LOC" ]]; then
 fi
 for F in FALDV6Series FADSV6Series; do
   ST=$(az feature show --namespace Microsoft.Compute --name "$F" --query properties.state -o tsv 2>/dev/null || echo "n/a")
-  echo "    FEATURE $F = $ST   (want 'Registered'; register with: az feature register --namespace Microsoft.Compute --name $F)"
+  echo "    FEATURE $F = $ST   (if 'NotRegistered' AND 'az feature register' returns"
+  echo "                        'FeatureRegistrationUnsupported' => restricted preview, cannot self-register)"
 done
 
 echo
@@ -91,9 +94,10 @@ echo "         mbr2gpt /validate /allowFullOS  &&  mbr2gpt /convert /allowFullOS
 echo "    (Windows Server 2016 has NO mbr2gpt -> upgrade guest to 2019/2022 first.)"
 echo "  * ctrl without NVMe  -> tag the disk: az disk update ... diskControllerTypes='SCSI, NVMe'"
 echo "  * SKU_AVAILABLE=NO / FEATURE ... != Registered  -> the target size is PREVIEW-gated (NOT quota)."
-echo "    Fix: az feature register --namespace Microsoft.Compute --name FALDV6Series ; wait for 'Registered';"
-echo "         then az provider register --namespace Microsoft.Compute.  Or use the diskless 'als_v6' via"
-echo "         blue/green rebuild (03W) since 'als_v6' is already available to this subscription."
+echo "    Note: FALDV6Series often returns 'FeatureRegistrationUnsupported' (restricted preview =>"
+echo "    NOT self-registerable; needs a Microsoft allowlist request). Preferred fix: use the GA"
+echo "    diskless 'als_v6' (Falsv6) size via the blue/green rebuild (03W), which is already"
+echo "    available and also avoids the resource-disk in-place resize restriction."
 echo "  * STORNVME_START != 0 -> set it to 0 so Windows boots on the NVMe controller."
 echo "  Once FIRMWARE=UEFI, BitLocker Off and STORNVME_START=0, run 02W to finish the upgrade."
 echo "==================================================================="

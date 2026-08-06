@@ -43,15 +43,15 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
   Windows allows, keeping the same OS disk, name and IP. If you specifically need the diskless
   `F4als_v6`, use Script `03W` (`03W-fsv2-bluegreen-to-v6-windows.sh`), which moves the pagefile
   off `D:` then **rebuilds** the VM on the diskless size from the existing OS disk.
-- **`F4alds_v6` "not available to the current subscription" (preview feature flag, NOT quota):**
-  the local-temp-disk `Fadsv6` sizes can be gated behind a preview flag in some subscriptions --
-  *"...must have one of the following feature flags registered: `Microsoft.Compute/FALDV6Series`..."*.
-  This is **not** a quota/vCPU limit. Register it once, wait for `Registered`, then re-run 02W:
-  `az feature register --namespace Microsoft.Compute --name FALDV6Series` then
-  `az provider register --namespace Microsoft.Compute`. If the flag stays `Pending`/`NotRegistered`
-  (restricted preview), the diskless `F4als_v6` is usually already available -- use the blue/green
-  rebuild (`03W`) onto it instead, which sidesteps both the resource-disk resize rule and the flag.
-  `diag-windows-v6-readiness.sh` now reports SKU availability and the `FALDV6Series` feature state.
+- **`F4alds_v6` "not available to the current subscription" (RESTRICTED preview, NOT quota):**
+  the local-temp-disk `Fadsv6` sizes can be gated behind the `Microsoft.Compute/FALDV6Series`
+  preview, which in most subscriptions is **not self-registerable** -- `az feature register
+  --namespace Microsoft.Compute --name FALDV6Series` returns `FeatureRegistrationUnsupported`
+  ("does not support registration"). This is **not** a quota/vCPU limit and **cannot** be fixed by
+  the subscription owner; access must be granted by Microsoft. **Preferred path:** switch the
+  target to the **GA diskless `Standard_F4als_v6`** (Falsv6, already available) via the blue/green
+  rebuild (`03W`) -- this avoids both the preview gate and the resource-disk in-place resize rule.
+  `diag-windows-v6-readiness.sh` reports SKU availability and the `FALDV6Series` feature state.
 
 > **In-place NVMe note (scripts 02 / 02F):** an older Gen1 OS disk does not advertise NVMe,
 > so a naive resize fails with *"Disk Controller Type property 'NVMe' is not supported by the
