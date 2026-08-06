@@ -237,41 +237,47 @@ phase "Prepare the Windows guest (pagefile off D:, MBR->GPT, NVMe driver), then 
 step "Running in-guest prep (this can take a few minutes)..."
 # shellcheck disable=SC2016  # the PowerShell must run inside the guest, not expand locally
 PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts '
-  $ErrorActionPreference = "Stop"
-  Write-Output ("OS=" + (Get-CimInstance Win32_OperatingSystem).Caption)
+  $ErrorActionPreference = "Continue"
+  try { Write-Output ("OS=" + (Get-CimInstance Win32_OperatingSystem).Caption) } catch { Write-Output "OS=UNKNOWN" }
   # 1) Move the pagefile OFF the temp disk (D:) to a system-managed pagefile on C:, so nothing
   #    depends on the local temp disk that the diskless target removes.
-  $cs = Get-CimInstance Win32_ComputerSystem
-  if (-not $cs.AutomaticManagedPagefile) { $cs | Set-CimInstance -Property @{AutomaticManagedPagefile=$true} | Out-Null }
-  Get-CimInstance Win32_PageFileSetting | Where-Object { $_.Name -notlike "C:*" } | Remove-CimInstance -ErrorAction SilentlyContinue
-  Write-Output "PAGEFILE=managed_on_C"
+  try {
+    $cs = Get-CimInstance Win32_ComputerSystem
+    if (-not $cs.AutomaticManagedPagefile) { $cs | Set-CimInstance -Property @{AutomaticManagedPagefile=$true} | Out-Null }
+    Get-CimInstance Win32_PageFileSetting | Where-Object { $_.Name -notlike "C:*" } | Remove-CimInstance -ErrorAction SilentlyContinue
+    Write-Output "PAGEFILE=managed_on_C"
+  } catch { Write-Output ("PAGEFILE=ERROR:" + $_.Exception.Message) }
   # 2) Gen1(MBR/BIOS) -> GPT/EFI with in-box MBR2GPT while still on Gen1 (WS2016 has no tool;
   #    disable BitLocker first). Azure does NOT auto-run this; Gen2 needs GPT/EFI.
-  $fw = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name PEFirmwareType -ErrorAction SilentlyContinue).PEFirmwareType
-  if ($fw -eq 2) { Write-Output "MBR2GPT=ALREADY_GPT" }
-  else {
-    $bl = $null
-    if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
-      try { $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue } catch { $bl = $null }
-    }
-    if ($bl -and $bl.ProtectionStatus -eq "On") { Write-Output "MBR2GPT=BITLOCKER_ON" }
-    elseif (-not (Test-Path "$env:SystemRoot\System32\mbr2gpt.exe")) { Write-Output "MBR2GPT=NO_TOOL_WS2016" }
+  try {
+    $fw = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name PEFirmwareType -ErrorAction SilentlyContinue).PEFirmwareType
+    if ($fw -eq 2) { Write-Output "MBR2GPT=ALREADY_GPT" }
     else {
-      Defrag C: /U 2>&1 | Out-Null
-      & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1 | Out-Null
-      if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=VALIDATE_FAIL" }
+      $bl = $null
+      if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+        try { $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue } catch { $bl = $null }
+      }
+      if ($bl -and $bl.ProtectionStatus -eq "On") { Write-Output "MBR2GPT=BITLOCKER_ON" }
+      elseif (-not (Test-Path "$env:SystemRoot\System32\mbr2gpt.exe")) { Write-Output "MBR2GPT=NO_TOOL_WS2016" }
       else {
-        & "$env:SystemRoot\System32\mbr2gpt.exe" /convert /allowFullOS 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=CONVERT_FAIL" } else { Write-Output "MBR2GPT=CONVERTED" }
+        Defrag C: /U 2>&1 | Out-Null
+        & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=VALIDATE_FAIL" }
+        else {
+          & "$env:SystemRoot\System32\mbr2gpt.exe" /convert /allowFullOS 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=CONVERT_FAIL" } else { Write-Output "MBR2GPT=CONVERTED" }
+        }
       }
     }
-  }
+  } catch { Write-Output ("MBR2GPT=ERROR:" + $_.Exception.Message) }
   # 3) Ensure StorNVMe is boot-start so the rebuilt VM boots on the NVMe controller.
-  $svc = "HKLM:\SYSTEM\CurrentControlSet\Services\stornvme"
-  if (Test-Path $svc) {
-    if ((Get-ItemProperty -Path $svc -Name Start).Start -ne 0) { Set-ItemProperty -Path $svc -Name Start -Value 0 }
-    Write-Output "STORNVME=OK"
-  } else { Write-Output "STORNVME=MISSING" }
+  try {
+    $svc = "HKLM:\SYSTEM\CurrentControlSet\Services\stornvme"
+    if (Test-Path $svc) {
+      if ((Get-ItemProperty -Path $svc -Name Start).Start -ne 0) { Set-ItemProperty -Path $svc -Name Start -Value 0 }
+      Write-Output "STORNVME=OK"
+    } else { Write-Output "STORNVME=MISSING" }
+  } catch { Write-Output ("STORNVME=ERROR:" + $_.Exception.Message) }
 ' --query "value[0].message" -o tsv 2>/dev/null || true)
 [ "$DRYRUN" != 1 ] && printf '%s\n' "$PREP" | sed 's/^/        /'
 
@@ -291,7 +297,9 @@ if [ "$DRYRUN" != 1 ]; then
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
     *VALIDATE_FAIL*)  die "mbr2gpt /validate failed." "Usually no free space at the end of C:. Run 'Defrag C: /U /V' / free space, then re-run.";;
     *CONVERT_FAIL*)   die "mbr2gpt /convert failed." "Review C:\\Windows\\setupact.log for MBR2GPT lines, then re-run.";;
+    *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
     *STORNVME=MISSING*) die "StorNVMe driver missing (very old image)." "Update the guest to WS2019+, then re-run.";;
+    *STORNVME=ERROR:*) die "Setting the StorNVMe boot-start raised an error (see 'STORNVME=ERROR:' above)." "Send us that line so we can adjust before the rebuild.";;
   esac
   ok "Guest prep applied (pagefile on C:; MBR->GPT done or already GPT; StorNVMe boot-start set)."
 fi
