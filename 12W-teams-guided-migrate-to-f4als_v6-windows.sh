@@ -250,8 +250,16 @@ PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShell
   # 2) Gen1(MBR/BIOS) -> GPT/EFI with in-box MBR2GPT while still on Gen1 (WS2016 has no tool;
   #    disable BitLocker first). Azure does NOT auto-run this; Gen2 needs GPT/EFI.
   try {
-    $fw = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name PEFirmwareType -ErrorAction SilentlyContinue).PEFirmwareType
-    if ($fw -eq 2) { Write-Output "MBR2GPT=ALREADY_GPT" }
+    # Detect the ACTUAL partition style of the OS disk (the one holding C:). The firmware
+    # registry value is unreliable on a Gen1 VM whose disk was already converted, so rely on
+    # the partition table + presence of an EFI System Partition (ESP) instead.
+    $osNum = (Get-Partition -DriveLetter C -ErrorAction SilentlyContinue).DiskNumber
+    if ($null -eq $osNum) { $osNum = 0 }
+    $style = (Get-Disk -Number $osNum -ErrorAction SilentlyContinue).PartitionStyle
+    $esp = @(Get-Partition -DiskNumber $osNum -ErrorAction SilentlyContinue | Where-Object { $_.GptType -eq "{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}" -or $_.Type -eq "System" })
+    Write-Output ("OSDISK=num:" + $osNum + " style:" + $style + " esp:" + $esp.Count)
+    if ($style -eq "GPT" -and $esp.Count -ge 1) { Write-Output "MBR2GPT=ALREADY_GPT" }
+    elseif ($style -eq "GPT") { Write-Output "MBR2GPT=GPT_NO_ESP" }
     else {
       $bl = $null
       if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
@@ -268,9 +276,9 @@ PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShell
           $lg = Get-Content "$env:SystemRoot\setupact.log" -ErrorAction SilentlyContinue | Select-String -Pattern "MBR2GPT" | Select-Object -Last 20
           foreach ($l in $lg) { Write-Output ("SETUPACT: " + $l.Line.Trim()) }
           try {
-            $d0 = Get-Disk -Number 0
-            Write-Output ("DISK0=style:" + $d0.PartitionStyle + " parts:" + (Get-Partition -DiskNumber 0 | Measure-Object).Count)
-            foreach ($p in (Get-Partition -DiskNumber 0)) { Write-Output ("PART: n=" + $p.PartitionNumber + " type=" + $p.Type + " size=" + [math]::Round($p.Size/1GB,2) + "GB drive=" + $p.DriveLetter) }
+            $d0 = Get-Disk -Number $osNum
+            Write-Output ("DISK0=style:" + $d0.PartitionStyle + " parts:" + (Get-Partition -DiskNumber $osNum | Measure-Object).Count)
+            foreach ($p in (Get-Partition -DiskNumber $osNum)) { Write-Output ("PART: n=" + $p.PartitionNumber + " type=" + $p.Type + " size=" + [math]::Round($p.Size/1GB,2) + "GB drive=" + $p.DriveLetter) }
           } catch {}
         }
         else {
@@ -308,6 +316,7 @@ if [ "$DRYRUN" != 1 ]; then
     *VALIDATE_FAIL*)  die "mbr2gpt /validate failed (details captured above: MBR2GPT_OUT / SETUPACT / DISK0 / PART lines)." "Send us those lines - they name the exact reason. Most common: >3 primary partitions, or no room for the ~100MB EFI system partition. Do NOT proceed; we'll advise the targeted fix.";;
     *CONVERT_FAIL*)   die "mbr2gpt /convert failed." "Review C:\\Windows\\setupact.log for MBR2GPT lines, then re-run.";;
     *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
+    *GPT_NO_ESP*)     die "The OS disk is GPT but has no EFI System Partition." "Unusual layout - send us the OSDISK/PART lines above so we can add the ESP before the Gen2 flip.";;
     *STORNVME=MISSING*) die "StorNVMe driver missing (very old image)." "Update the guest to WS2019+, then re-run.";;
     *STORNVME=ERROR:*) die "Setting the StorNVMe boot-start raised an error (see 'STORNVME=ERROR:' above)." "Send us that line so we can adjust before the rebuild.";;
   esac
