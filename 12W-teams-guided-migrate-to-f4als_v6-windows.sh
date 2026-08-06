@@ -261,8 +261,18 @@ PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShell
       elseif (-not (Test-Path "$env:SystemRoot\System32\mbr2gpt.exe")) { Write-Output "MBR2GPT=NO_TOOL_WS2016" }
       else {
         Defrag C: /U 2>&1 | Out-Null
-        & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=VALIDATE_FAIL" }
+        $mv = & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1
+        if ($LASTEXITCODE -ne 0) {
+          Write-Output "MBR2GPT=VALIDATE_FAIL"
+          Write-Output ("MBR2GPT_OUT=" + (($mv | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
+          $lg = Get-Content "$env:SystemRoot\setupact.log" -ErrorAction SilentlyContinue | Select-String -Pattern "MBR2GPT" | Select-Object -Last 20
+          foreach ($l in $lg) { Write-Output ("SETUPACT: " + $l.Line.Trim()) }
+          try {
+            $d0 = Get-Disk -Number 0
+            Write-Output ("DISK0=style:" + $d0.PartitionStyle + " parts:" + (Get-Partition -DiskNumber 0 | Measure-Object).Count)
+            foreach ($p in (Get-Partition -DiskNumber 0)) { Write-Output ("PART: n=" + $p.PartitionNumber + " type=" + $p.Type + " size=" + [math]::Round($p.Size/1GB,2) + "GB drive=" + $p.DriveLetter) }
+          } catch {}
+        }
         else {
           & "$env:SystemRoot\System32\mbr2gpt.exe" /convert /allowFullOS 2>&1 | Out-Null
           if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=CONVERT_FAIL" } else { Write-Output "MBR2GPT=CONVERTED" }
@@ -295,7 +305,7 @@ if [ "$DRYRUN" != 1 ]; then
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
-    *VALIDATE_FAIL*)  die "mbr2gpt /validate failed." "Usually no free space at the end of C:. Run 'Defrag C: /U /V' / free space, then re-run.";;
+    *VALIDATE_FAIL*)  die "mbr2gpt /validate failed (details captured above: MBR2GPT_OUT / SETUPACT / DISK0 / PART lines)." "Send us those lines - they name the exact reason. Most common: >3 primary partitions, or no room for the ~100MB EFI system partition. Do NOT proceed; we'll advise the targeted fix.";;
     *CONVERT_FAIL*)   die "mbr2gpt /convert failed." "Review C:\\Windows\\setupact.log for MBR2GPT lines, then re-run.";;
     *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
     *STORNVME=MISSING*) die "StorNVMe driver missing (very old image)." "Update the guest to WS2019+, then re-run.";;
