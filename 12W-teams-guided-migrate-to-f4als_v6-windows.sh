@@ -29,6 +29,14 @@
 # ---------------------------------------------------------------------------
 # HOW TO USE  (detailed, copy-paste steps -- safe for someone new to Azure)
 #
+#   PREREQUISITE - run as **Contributor on the resource group** (or higher). That single role
+#     covers every action this script performs: create the safety snapshot, tag the disk NVMe,
+#     convert to Gen2 (Trusted Launch), and delete + recreate the VM on the new size. No
+#     subscription-level or RBAC-management rights are needed. If a step returns
+#     'AuthorizationFailed', ask the subscription owner to assign Contributor on the RG:
+#        az role assignment create --assignee <your-upn> --role Contributor \
+#          --scope /subscriptions/<sub-id>/resourceGroups/<resource-group>
+#
 #   STEP 0 - Open the RIGHT shell (avoids the PowerShell/Bash trap)
 #     Go to  https://shell.azure.com  and click **Switch to Bash** (top-left) if the
 #     prompt starts with 'PS'. Azure CLI is preinstalled and you are already logged
@@ -55,7 +63,8 @@
 #     The script prints each step with [ OK ] / [FAIL] and PAUSES between phases.
 #     When it finishes (or stops), COPY THE FULL OUTPUT and send it back to us.
 #
-#   REQUIRED : RG, VM   (the VM must be RUNNING so the in-guest prep can run)
+#   REQUIRED : RG, VM   (the VM must be RUNNING so the in-guest prep can run;
+#                        run as Contributor on the resource group -- see PREREQUISITE above)
 #   OPTIONAL : TARGET_SIZE  (default Standard_F4als_v6; use Standard_F8als_v6 for 8 vCPU)
 #              SNAPSHOT     (a pre-existing safety snapshot name; if unset one is created)
 #              ZONE         (availability zone for the rebuilt VM, e.g. 3; auto-detected)
@@ -155,25 +164,15 @@ if [ "${SKU_OK:-0}" = 0 ]; then
 fi
 ok "Target size '$TARGET_SIZE' is available in '$LOCATION'."
 
-# Best-effort permission check: the migration needs Contributor-level rights on the RG (snapshot
-# create, disk write, VM write/delete, run-command). Warn early if we cannot confirm them, so the
-# operator can request access BEFORE we start the VM. (The snapshot step below is the hard gate.)
-step "Checking your permissions on resource group '$RG'..."
+# PREREQUISITE: this script is designed to run as **Contributor on the resource group '$RG'** (or
+# higher). Contributor covers every action used here - snapshots/write, disks/write,
+# virtualMachines/write|delete|deallocate|start, virtualMachines/runCommand/action and the NIC
+# actions. We do NOT probe Azure AD / role assignments (a Contributor or guest account may lack the
+# Microsoft Graph directory permission needed to read them). Instead, each write step below VERIFIES
+# its own result and hard-stops on 'AuthorizationFailed' - the safety-snapshot step is the first gate.
 SUBID=$(az account show --query id -o tsv 2>/dev/null)
-ME=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || echo "")
 RGSCOPE="/subscriptions/${SUBID}/resourceGroups/${RG}"
-HASROLE=0
-if [ -n "$ME" ]; then
-  HASROLE=$(az role assignment list --assignee "$ME" --scope "$RGSCOPE" --include-inherited \
-    --query "[?roleDefinitionName=='Owner' || roleDefinitionName=='Contributor'] | length(@)" -o tsv 2>/dev/null || echo 0)
-fi
-if [ "${HASROLE:-0}" != 0 ]; then
-  ok "You have Contributor/Owner on '$RG' (snapshot + rebuild are permitted)."
-else
-  warn "Could not confirm Contributor/Owner on '$RG'. If any step below fails with 'AuthorizationFailed',"
-  warn "ask the subscription owner to grant **Contributor** on resource group '$RG', then re-run."
-  warn "  az role assignment create --assignee '$(az account show --query user.name -o tsv 2>/dev/null)' --role Contributor --scope '$RGSCOPE'"
-fi
+ok "Running as: $(az account show --query user.name -o tsv 2>/dev/null)  (needs Contributor on '$RG')"
 
 # The in-guest prep needs the VM running.
 case "${POWER:-}" in
@@ -210,7 +209,7 @@ else
   # proceed without a real rollback point.
   if [ "$DRYRUN" != 1 ]; then
     az snapshot show -g "$RG" -n "$SNAPSHOT" >/dev/null 2>&1 \
-      || die "Safety snapshot was NOT created (see the error above)." "This is usually a missing permission ('Microsoft.Compute/snapshots/write'). We must have a rollback point before migrating - do NOT proceed. Either (a) ask someone with rights to create a snapshot and re-run with SNAPSHOT=<name>, or (b) have the subscription owner grant Contributor / Disk Snapshot Contributor on the resource group."
+      || die "Safety snapshot was NOT created (see the error above)." "This is a missing permission ('Microsoft.Compute/snapshots/write'). We must have a rollback point before migrating - do NOT proceed. Ask the subscription owner to grant Contributor on the resource group:  az role assignment create --assignee <your-upn> --role Contributor --scope '$RGSCOPE'  -- then re-run. (Or run with SNAPSHOT=<an existing snapshot name>.)"
   fi
   ok "Safety snapshot created: $SNAPSHOT"
 fi
