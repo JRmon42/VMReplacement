@@ -69,6 +69,7 @@
 #              SNAPSHOT     (a pre-existing safety snapshot name; if unset one is created)
 #              SNAPSHOT_SKU (storage SKU for the safety snapshot; auto-matched to the disk's
 #                            existing incremental snapshots -- set Standard_ZRS if it complains)
+#              REUSE_SNAPSHOT=0  force a brand-new snapshot instead of reusing the newest existing one
 #              ZONE         (availability zone for the rebuilt VM, e.g. 3; auto-detected)
 #              AUTO=1       run without pausing between phases (no prompts)
 #              DRYRUN=1     print the state-changing az commands, do NOT run them
@@ -209,24 +210,37 @@ if [ -n "$SNAPSHOT" ]; then
   az snapshot show -g "$RG" -n "$SNAPSHOT" >/dev/null 2>&1 || die "Provided SNAPSHOT '$SNAPSHOT' not found."
   ok "Using existing snapshot: $SNAPSHOT"
 else
-  SNAPSHOT="${VM}-pre-f4alsv6-$(date +%Y%m%d-%H%M%S)"
-  OSID=$(az vm show -g "$RG" -n "$VM" --query "storageProfile.osDisk.managedDisk.id" -o tsv 2>/dev/null)
-  # Azure requires a new INCREMENTAL snapshot to use the SAME storage SKU as any existing
-  # incremental snapshots of the same disk (else ConflictingUserInput LRS-vs-ZRS). Auto-match it.
-  if [ -z "$SNAPSHOT_SKU" ]; then
-    SNAPSHOT_SKU=$(az snapshot list -g "$RG" --query "[?creationData.sourceResourceId=='$OSID' && incremental].sku.name | [0]" -o tsv 2>/dev/null)
+  # Reuse the newest existing pre-migration snapshot of this VM if one is already there. This
+  # avoids re-creating a snapshot on every re-run and sidesteps transient create failures
+  # (auth token timeout, SKU races). Set REUSE_SNAPSHOT=0 to force a brand-new snapshot.
+  REUSE_SNAPSHOT="${REUSE_SNAPSHOT:-1}"
+  EXIST=""
+  if [ "$REUSE_SNAPSHOT" = 1 ]; then
+    EXIST=$(az snapshot list -g "$RG" --query "sort_by([?starts_with(name,'${VM}-pre-f4alsv6-')],&timeCreated)[-1].name" -o tsv 2>/dev/null)
   fi
-  [ -z "$SNAPSHOT_SKU" ] && SNAPSHOT_SKU="Standard_LRS"
-  step "Creating incremental snapshot '$SNAPSHOT' (sku $SNAPSHOT_SKU) from the current OS disk..."
-  run az snapshot create -g "$RG" -n "$SNAPSHOT" --source "$OSID" --incremental true --sku "$SNAPSHOT_SKU" -o none
-  # VERIFY the snapshot actually exists - 'az snapshot create' can print an error (e.g.
-  # AuthorizationFailed: missing Microsoft.Compute/snapshots/write, or a SKU mismatch) yet the
-  # script must NOT proceed without a real rollback point.
-  if [ "$DRYRUN" != 1 ]; then
-    az snapshot show -g "$RG" -n "$SNAPSHOT" >/dev/null 2>&1 \
-      || die "Safety snapshot was NOT created (see the error above)." "We must have a rollback point before migrating - do NOT proceed. If the error is a SKU mismatch (LRS vs ZRS), re-run with SNAPSHOT_SKU=Standard_ZRS. If it is AuthorizationFailed (missing Microsoft.Compute/snapshots/write), ask the subscription owner to grant Contributor on the resource group:  az role assignment create --assignee <your-upn> --role Contributor --scope '$RGSCOPE'  -- then re-run. (Or run with SNAPSHOT=<an existing snapshot name>.)"
+  if [ -n "$EXIST" ] && [ "$EXIST" != "None" ]; then
+    SNAPSHOT="$EXIST"
+    ok "Reusing existing safety snapshot: $SNAPSHOT (set REUSE_SNAPSHOT=0 to force a new one)"
+  else
+    SNAPSHOT="${VM}-pre-f4alsv6-$(date +%Y%m%d-%H%M%S)"
+    OSID=$(az vm show -g "$RG" -n "$VM" --query "storageProfile.osDisk.managedDisk.id" -o tsv 2>/dev/null)
+    # Azure requires a new INCREMENTAL snapshot to use the SAME storage SKU as any existing
+    # incremental snapshots of the same disk (else ConflictingUserInput LRS-vs-ZRS). Auto-match it.
+    if [ -z "$SNAPSHOT_SKU" ]; then
+      SNAPSHOT_SKU=$(az snapshot list -g "$RG" --query "[?creationData.sourceResourceId=='$OSID' && incremental].sku.name | [0]" -o tsv 2>/dev/null)
+    fi
+    [ -z "$SNAPSHOT_SKU" ] || [ "$SNAPSHOT_SKU" = "None" ] && SNAPSHOT_SKU="Standard_LRS"
+    step "Creating incremental snapshot '$SNAPSHOT' (sku $SNAPSHOT_SKU) from the current OS disk..."
+    run az snapshot create -g "$RG" -n "$SNAPSHOT" --source "$OSID" --incremental true --sku "$SNAPSHOT_SKU" -o none
+    # VERIFY the snapshot actually exists - 'az snapshot create' can print an error (e.g.
+    # AuthorizationFailed: missing Microsoft.Compute/snapshots/write, a SKU mismatch, or a
+    # Cloud Shell token timeout) yet the script must NOT proceed without a real rollback point.
+    if [ "$DRYRUN" != 1 ]; then
+      az snapshot show -g "$RG" -n "$SNAPSHOT" >/dev/null 2>&1 \
+        || die "Safety snapshot was NOT created (see the error above)." "We must have a rollback point before migrating - do NOT proceed. If it says 'Timeout waiting for token'/credential problem, your Cloud Shell session expired: run 'az login' (or restart Cloud Shell), then re-run. If it is a SKU mismatch (LRS vs ZRS), re-run with SNAPSHOT_SKU=Standard_ZRS. If it is AuthorizationFailed (missing Microsoft.Compute/snapshots/write), ask the subscription owner to grant Contributor on the resource group:  az role assignment create --assignee <your-upn> --role Contributor --scope '$RGSCOPE'  -- then re-run. (Or run with SNAPSHOT=<an existing snapshot name>.)"
+    fi
+    ok "Safety snapshot created: $SNAPSHOT"
   fi
-  ok "Safety snapshot created: $SNAPSHOT"
 fi
 warn "ROLLBACK POINT: keep this snapshot name -> $SNAPSHOT"
 mark "Safety snapshot ready ($SNAPSHOT)"; recap
