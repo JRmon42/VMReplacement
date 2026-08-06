@@ -158,7 +158,19 @@ ok "Target size '$TARGET_SIZE' is available in '$LOCATION'."
 # The in-guest prep needs the VM running.
 case "${POWER:-}" in
   *running*) ok "VM is running (in-guest prep can run).";;
-  *) if [ "$DRYRUN" != 1 ]; then step "VM not running - starting it so the in-guest prep can run..."; run az vm start -g "$RG" -n "$VM" -o none; fi;;
+  *)
+    if [ "$DRYRUN" = 1 ]; then
+      warn "VM is '${POWER:-unknown}'. In a real run it is started here and we wait for the guest agent before the in-guest prep."
+    else
+      step "VM is '${POWER:-unknown}' - starting it so the in-guest prep can run..."
+      run az vm start -g "$RG" -n "$VM" -o none
+      if wait_boot "$BOOT_TRIES"; then
+        ok "VM started and the guest agent is responding."
+      else
+        die "VM did not become ready after start." "Start it in the portal, confirm the Azure VM guest agent is healthy, then re-run."
+      fi
+    fi
+    ;;
 esac
 mark "Preflight OK - target available, VM/OS-disk/NIC resolved"; recap
 confirm "Proceed to take a safety snapshot?"
@@ -220,6 +232,11 @@ PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShell
 [ "$DRYRUN" != 1 ] && printf '%s\n' "$PREP" | sed 's/^/        /'
 
 if [ "$DRYRUN" != 1 ]; then
+  # Empty/again-partial result => the guest agent did not run our script (VM not fully booted, agent
+  # unhealthy, or run-command blocked). Treat as a hard failure rather than a false success.
+  if ! grep -q "STORNVME=" <<<"$PREP"; then
+    die "The in-guest preparation returned no result." "The Azure VM guest agent did not run the script (VM still booting, agent unhealthy, or run-command blocked). Confirm the VM is running and the guest agent is 'Ready' in the portal, then re-run."
+  fi
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
