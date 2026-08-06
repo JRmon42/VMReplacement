@@ -53,6 +53,13 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
   target to the **GA diskless `Standard_F4als_v6`** (Falsv6, already available) via the blue/green
   rebuild (`03W`) -- this avoids both the preview gate and the resource-disk in-place resize rule.
   `diag-windows-v6-readiness.sh` reports SKU availability and the `FALDV6Series` feature state.
+- **Permissions to run the migration (`AuthorizationFailed`):** the operator needs **Contributor**
+  on the resource group (covers `Microsoft.Compute/snapshots/write`, `disks/write`,
+  `virtualMachines/write|delete|deallocate|start`, `virtualMachines/runCommand/action`, and the
+  NIC actions). A narrower custom role also works, but Contributor scoped to the RG is the simplest
+  least-privilege ask (it excludes RBAC/policy changes). Assign it with:
+  `az role assignment create --assignee <upn-or-objectId> --role Contributor --scope /subscriptions/<sub>/resourceGroups/<rg>`.
+  `12W` does a best-effort permission preflight and hard-stops if the safety snapshot cannot be created.
 
 > **In-place NVMe note (scripts 02 / 02F):** an older Gen1 OS disk does not advertise NVMe,
 > so a naive resize fails with *"Disk Controller Type property 'NVMe' is not supported by the

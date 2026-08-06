@@ -155,6 +155,26 @@ if [ "${SKU_OK:-0}" = 0 ]; then
 fi
 ok "Target size '$TARGET_SIZE' is available in '$LOCATION'."
 
+# Best-effort permission check: the migration needs Contributor-level rights on the RG (snapshot
+# create, disk write, VM write/delete, run-command). Warn early if we cannot confirm them, so the
+# operator can request access BEFORE we start the VM. (The snapshot step below is the hard gate.)
+step "Checking your permissions on resource group '$RG'..."
+SUBID=$(az account show --query id -o tsv 2>/dev/null)
+ME=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || echo "")
+RGSCOPE="/subscriptions/${SUBID}/resourceGroups/${RG}"
+HASROLE=0
+if [ -n "$ME" ]; then
+  HASROLE=$(az role assignment list --assignee "$ME" --scope "$RGSCOPE" --include-inherited \
+    --query "[?roleDefinitionName=='Owner' || roleDefinitionName=='Contributor'] | length(@)" -o tsv 2>/dev/null || echo 0)
+fi
+if [ "${HASROLE:-0}" != 0 ]; then
+  ok "You have Contributor/Owner on '$RG' (snapshot + rebuild are permitted)."
+else
+  warn "Could not confirm Contributor/Owner on '$RG'. If any step below fails with 'AuthorizationFailed',"
+  warn "ask the subscription owner to grant **Contributor** on resource group '$RG', then re-run."
+  warn "  az role assignment create --assignee '$(az account show --query user.name -o tsv 2>/dev/null)' --role Contributor --scope '$RGSCOPE'"
+fi
+
 # The in-guest prep needs the VM running.
 case "${POWER:-}" in
   *running*) ok "VM is running (in-guest prep can run).";;
