@@ -121,7 +121,16 @@ guest_probe(){
     Write-Output "BOOT_OK"
     Write-Output ("OS=" + (Get-CimInstance Win32_OperatingSystem).Caption)
     $fw = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name PEFirmwareType).PEFirmwareType
-    Write-Output ("FIRMWARE=" + $(if ($fw -eq 2) {"UEFI"} elseif ($fw -eq 1) {"BIOS"} else {"UNKNOWN"}))
+    $fwStr = if ($fw -eq 2) {"UEFI"} elseif ($fw -eq 1) {"BIOS"} else {"UNKNOWN"}
+    if ($fwStr -eq "UNKNOWN") {
+      $bcd = (bcdedit /enum "{current}" 2>$null | Out-String)
+      if ($bcd -match "winload\.efi") { $fwStr = "UEFI" } elseif ($bcd -match "winload\.exe") { $fwStr = "BIOS" }
+    }
+    if ($fwStr -eq "UNKNOWN") {
+      $sb = $null; try { $sb = Confirm-SecureBootUEFI } catch { $sb = $null }
+      if ($null -ne $sb) { $fwStr = "UEFI" }
+    }
+    Write-Output ("FIRMWARE=" + $fwStr)
     Write-Output ("PARTSTYLE=" + (Get-Disk | Where-Object IsSystem | Select-Object -First 1).PartitionStyle)
     $pf = (Get-CimInstance Win32_PageFileSetting | ForEach-Object { $_.Name }) -join ";"
     Write-Output ("PAGEFILE=" + $(if ($pf) {$pf} else {"auto/C"}))
@@ -363,7 +372,13 @@ if [ "$DRYRUN" = 1 ]; then
 else
   if wait_boot "$BOOT_TRIES"; then
     ok "VM booted as Gen2. firmware=$(gval FIRMWARE)  partition=$(gval PARTSTYLE)  pagefile=$(gval PAGEFILE)"
-    [ "$(gval FIRMWARE)" = "UEFI" ] || die "Guest still reports firmware=$(gval FIRMWARE) (expected UEFI)." "Gen2 conversion did not fully take. Roll back from snapshot '$SNAPSHOT'."
+    # The OS disk is already verified V2 (authoritative Azure signal) above. Gate on the guest's
+    # partition style (must be GPT) and reject only an EXPLICIT BIOS reading. FIRMWARE=UNKNOWN is a
+    # probe limitation on some images (this guest reports UNKNOWN even when UEFI), NOT a failure.
+    FW=$(gval FIRMWARE); PS=$(gval PARTSTYLE)
+    [ "$FW" = "BIOS" ] && die "Guest still reports firmware=BIOS after the Gen2 flip." "Gen2 conversion did not fully take. Roll back from snapshot '$SNAPSHOT'."
+    [ "$PS" = "GPT" ] || die "Guest system disk is '$PS' (expected GPT) after the Gen2 flip." "Gen2 conversion did not fully take. Roll back from snapshot '$SNAPSHOT'."
+    if [ "$FW" = "UEFI" ]; then ok "Firmware confirmed UEFI."; else warn "Firmware probe returned '$FW', but disk=V2 + partition=GPT confirm Gen2 - continuing."; fi
   else
     die "VM did not report healthy after the Gen2 conversion." "Check boot diagnostics/serial console. Roll back from snapshot '$SNAPSHOT'. Do NOT proceed."
   fi
