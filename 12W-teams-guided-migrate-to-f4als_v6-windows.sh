@@ -250,7 +250,10 @@ PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShell
   $fw = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control" -Name PEFirmwareType -ErrorAction SilentlyContinue).PEFirmwareType
   if ($fw -eq 2) { Write-Output "MBR2GPT=ALREADY_GPT" }
   else {
-    $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
+    $bl = $null
+    if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+      try { $bl = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue } catch { $bl = $null }
+    }
     if ($bl -and $bl.ProtectionStatus -eq "On") { Write-Output "MBR2GPT=BITLOCKER_ON" }
     elseif (-not (Test-Path "$env:SystemRoot\System32\mbr2gpt.exe")) { Write-Output "MBR2GPT=NO_TOOL_WS2016" }
     else {
@@ -275,8 +278,13 @@ PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShell
 if [ "$DRYRUN" != 1 ]; then
   # Empty/again-partial result => the guest agent did not run our script (VM not fully booted, agent
   # unhealthy, or run-command blocked). Treat as a hard failure rather than a false success.
+  # Distinguish "agent never ran our script" (empty) from "script ran but errored partway"
+  # (has some markers but not the final STORNVME=). Either way we must not proceed.
   if ! grep -q "STORNVME=" <<<"$PREP"; then
-    die "The in-guest preparation returned no result." "The Azure VM guest agent did not run the script (VM still booting, agent unhealthy, or run-command blocked). Confirm the VM is running and the guest agent is 'Ready' in the portal, then re-run."
+    if [ -z "${PREP//[[:space:]]/}" ]; then
+      die "The in-guest preparation returned no result." "The Azure VM guest agent did not run the script (VM still booting, agent unhealthy, or run-command blocked). Confirm the VM is running and the guest agent is 'Ready' in the portal, then re-run."
+    fi
+    die "The in-guest preparation did not finish (see the partial output above)." "The guest script stopped before completing all steps. Copy the full output above and send it to us so we can pinpoint the failing step, then re-run."
   fi
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
