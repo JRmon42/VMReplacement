@@ -96,7 +96,13 @@ bad(){  printf '   [ %sFAIL%s ] %s\n' "$c_bad" "$c_reset" "$1"; }
 warn(){ printf '   [ %sWARN%s ] %s\n' "$c_wn" "$c_reset" "$1"; }
 die(){  bad "$1"; printf '\n%sSTOPPED.%s %s\n' "$c_bad" "$c_reset" "${2:-Nothing further was changed. Share the output above with us.}"; exit 1; }
 run(){ if [ "$DRYRUN" = 1 ]; then printf '   %s[dry-run]%s %s\n' "$c_wn" "$c_reset" "$*"; else "$@"; fi; }
-confirm(){ if [ "$AUTO" = 1 ]; then return 0; fi; printf '   %s? %s%s ' "$c_wn" "$1" "$c_reset"; read -r ans; case "$ans" in y|Y|yes|YES|"") return 0;; *) die "Paused by user." "Re-run when ready; completed steps above are already applied.";; esac; }
+confirm(){
+  if [ "$AUTO" = 1 ]; then printf '   %s[AUTO]%s %s -> yes\n' "$c_wn" "$c_reset" "$1"; return 0; fi
+  if [ ! -t 0 ]; then die "No interactive terminal to answer '$1'." "Run the script directly in the Bash Cloud Shell (do not pipe it), or add AUTO=1 to skip the prompts."; fi
+  printf '\n   %s>>> ACTION NEEDED:%s %s %s[Y/n]%s ' "$c_wn" "$c_reset" "$1" "$c_wn" "$c_reset"
+  read -r ans
+  case "$ans" in y|Y|yes|YES|"") return 0;; *) die "Paused by user." "Re-run when ready; completed steps above are already applied.";; esac
+}
 
 # ------------------------------ progress log -------------------------------
 DONE=()
