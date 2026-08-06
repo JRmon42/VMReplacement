@@ -26,30 +26,53 @@
 #     default. (https://aka.ms/AAah4sj)
 #
 # ---------------------------------------------------------------------------
-# HOW TO USE
-#   1. Open Azure Cloud Shell (Bash) at https://shell.azure.com  -- az is preinstalled
-#      and you are already logged in. (Or a local Bash with Azure CLI + 'az login'.)
-#   2. Select the right subscription:
-#        az account set --subscription "245843b4-f532-4374-9864-7c7eb82d3e18"
-#   3. Download this script, then run it with the VM values, e.g.:
+# HOW TO USE  (detailed, copy-paste steps -- safe for someone new to Azure)
 #
+#   STEP 0 - Open the RIGHT shell (avoids the PowerShell/Bash trap)
+#     Go to  https://shell.azure.com  and choose **Bash** (NOT PowerShell). Azure CLI
+#     is preinstalled and you are already logged in. Then select the subscription:
+#        az account set --subscription "245843b4-f532-4374-9864-7c7eb82d3e18"
+#        az account show --query name -o tsv
+#     -> confirms you are in the correct subscription before touching anything.
+#     (PowerShell '$RG=...' variables do NOT pass into a bash script -- use Bash.)
+#
+#   STEP 1 - Pick the TARGET size (important!)
+#     * F4alds_v6 (keeps a local D: temp disk) needs the 'Microsoft.Compute/FALDV6Series'
+#       preview. In most subscriptions this is NOT self-registerable -- 'az feature
+#       register --namespace Microsoft.Compute --name FALDV6Series' returns
+#       'FeatureRegistrationUnsupported'. If so, do NOT use 11W with F4alds_v6.
+#     * F4als_v6 (NO local temp disk) is GENERALLY AVAILABLE and already usable, but a
+#       Windows *in-place* resize to it is blocked (resource-disk rule). For F4als_v6 use
+#       the blue/green rebuild script 03W-fsv2-bluegreen-to-v6-windows.sh instead of 11W.
+#     Check state first:
+#        az feature show --namespace Microsoft.Compute --name FALDV6Series --query properties.state -o tsv
+#     -> 'Registered'  => you MAY run 11W with TARGET_SIZE=Standard_F4alds_v6 (below).
+#     -> anything else => use 03W (blue/green) onto Standard_F4als_v6; tell us on the call.
+#
+#   STEP 2 - Confirm a CLEAN pre-migration snapshot exists (11W REQUIRES one):
+#        az snapshot list -g rg-mfgtransnonprod-servicenow \
+#          --query "[?contains(name,'azumw57012')].{name:name,created:timeCreated,gen:hyperVGeneration}" -o table
+#     Copy the snapshot NAME for STEP 4. If none is listed, tell us BEFORE running PART A.
+#
+#   STEP 3 - Download this script:
+#        curl -O https://raw.githubusercontent.com/JRmon42/VMReplacement/main/11W-teams-guided-recover-and-migrate-windows.sh
+#
+#   STEP 4 - Run it (values inline, on the SAME bash line):
 #        RG="rg-mfgtransnonprod-servicenow" \
 #        VM="azumw57012" \
-#        SNAPSHOT="azumw57012-os-YYYYMMDD-HHMMSS" \
+#        SNAPSHOT="<paste-snapshot-name-from-STEP-2>" \
 #        TARGET_SIZE="Standard_F4alds_v6" \
 #        ROLLBACK_SIZE="Standard_F4s_v2" \
 #        bash 11W-teams-guided-recover-and-migrate-windows.sh
+#     The script prints each step with [ OK ] / [FAIL] and PAUSES between phases.
+#     When it finishes (or stops), COPY THE FULL OUTPUT and send it back to us.
 #
 #   REQUIRED : RG, VM, SNAPSHOT (a CLEAN pre-migration snapshot of the OS disk)
-#   OPTIONAL : TARGET_SIZE   (default Standard_F4alds_v6)
+#   OPTIONAL : TARGET_SIZE   (default Standard_F4alds_v6 -- needs FALDV6Series 'Registered')
 #              ROLLBACK_SIZE (default Standard_F4s_v2 - the original size)
 #              MODE=full | rollback-only | migrate-only   (default full)
 #              AUTO=1        run without pausing between phases (no prompts)
 #              DRYRUN=1      print the state-changing az commands, do NOT run them
-#
-#   If you do not know the snapshot name, list candidates:
-#        az snapshot list -g "$RG" --query "[?contains(name,'azumw57012')].{name:name,created:timeCreated,gen:hyperVGeneration}" -o table
-#   If no clean snapshot exists, tell us on the call BEFORE running PART A.
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -143,6 +166,20 @@ if [ "$MODE" != migrate-only ]; then
   az snapshot show -g "$RG" -n "$SNAPSHOT" >/dev/null 2>&1 || die "Snapshot '$SNAPSHOT' not found in RG '$RG'."
   SNAP_GEN=$(az snapshot show -g "$RG" -n "$SNAPSHOT" --query hyperVGeneration -o tsv 2>/dev/null)
   ok "Rollback snapshot: $SNAPSHOT (gen=${SNAP_GEN:-?}, created $(az snapshot show -g "$RG" -n "$SNAPSHOT" --query timeCreated -o tsv 2>/dev/null))"
+fi
+
+# GUARD: fail fast if the target size is not actually offered to this subscription in this region
+# (e.g. F4alds_v6 needs the restricted, non-self-registerable FALDV6Series preview). Better to stop
+# here than to roll back + convert and only fail at the final resize.
+if [ "$MODE" != rollback-only ] && [ -n "${LOCATION:-}" ]; then
+  TSIZE="${TARGET_SIZE#Standard_}"
+  SKU_OK=$(az vm list-skus -l "$LOCATION" --size "$TSIZE" --query "[?name=='$TARGET_SIZE'] | length(@)" -o tsv 2>/dev/null || echo 0)
+  if [ "${SKU_OK:-0}" = 0 ]; then
+    warn "TARGET_SIZE '$TARGET_SIZE' is NOT offered to this subscription in '$LOCATION'."
+    warn "This is usually the restricted FALDV6Series preview (F*alds_v6), which cannot be self-registered."
+    die "Target size '$TARGET_SIZE' unavailable in $LOCATION." "Use the GA diskless 'Standard_F4als_v6' via the blue/green rebuild (03W-fsv2-bluegreen-to-v6-windows.sh) -- it avoids both the preview gate and the in-place resource-disk restriction. Or set TARGET_SIZE to a size this subscription can use and re-run. Tell us on the call which you prefer."
+  fi
+  ok "Target size '$TARGET_SIZE' is available in '$LOCATION'."
 fi
 mark "Preflight OK"; recap
 confirm "Proceed?"
