@@ -279,31 +279,46 @@ phase "Prepare the Windows guest (pagefile off D:, MBR->GPT, NVMe driver), then 
 warn "This step runs INSIDE Windows and is the SLOWEST part of the migration."
 warn "mbr2gpt (and a defrag, if one is needed) can take 20-60 minutes on a busy production C:."
 warn "A progress line is printed every 20s. DO NOT press Ctrl-C and DO NOT close this window."
+warn "If the OS disk is still MBR, the pagefile is removed for the duration of the conversion so"
+warn "that C: can be shrunk; you may be asked for ONE Windows restart, then it continues by itself."
+warn "A system-managed pagefile on C: is restored automatically once the disk is GPT."
 step "Running in-guest prep (expect 5-60 min; progress is printed below)..."
 # shellcheck disable=SC2016  # the PowerShell must run inside the guest, not expand locally
 GUEST_PREP_PS='
   $ErrorActionPreference = "Continue"
   Write-Output "PREP_BEGIN"
   try { Write-Output ("OS=" + (Get-CimInstance Win32_OperatingSystem).Caption) } catch { Write-Output "OS=UNKNOWN" }
-  # 1) Move the pagefile OFF the temp disk (D:) to a system-managed pagefile on C:, so nothing
-  #    depends on the local temp disk that the diskless target removes.
+  # 0) Identify the OS disk and its REAL partition style first - the pagefile decision below
+  #    depends on whether an MBR -> GPT conversion is still pending. The firmware registry value
+  #    is unreliable on a Gen1 VM whose disk was already converted, so rely on the partition
+  #    table + presence of an EFI System Partition (ESP) instead.
+  $osNum = (Get-Partition -DriveLetter C -ErrorAction SilentlyContinue).DiskNumber
+  if ($null -eq $osNum) { $osNum = 0 }
+  $style = (Get-Disk -Number $osNum -ErrorAction SilentlyContinue).PartitionStyle
+  $esp = @(Get-Partition -DiskNumber $osNum -ErrorAction SilentlyContinue | Where-Object { $_.GptType -eq "{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}" -or $_.Type -eq "System" })
+  Write-Output ("OSDISK=num:" + $osNum + " style:" + $style + " esp:" + $esp.Count)
+  $needConvert = ($style -ne "GPT")
+  # 1) Pagefile. The target size has NO local temp disk, so the pagefile must not live on D:.
+  #    While an MBR -> GPT conversion is still pending we remove the pagefile ENTIRELY instead of
+  #    moving it to C:. pagefile.sys is an immovable file and, sitting at the end of C:, it is the
+  #    usual reason mbr2gpt cannot shrink C: to carve the ~100MB EFI partition ("Partition final
+  #    size is <n> (initial size was <n>), cannot rely on this space"). A system-managed pagefile
+  #    on C: is put back automatically as soon as the disk is GPT.
   try {
     $cs = Get-CimInstance Win32_ComputerSystem
-    if (-not $cs.AutomaticManagedPagefile) { $cs | Set-CimInstance -Property @{AutomaticManagedPagefile=$true} | Out-Null }
-    Get-CimInstance Win32_PageFileSetting | Where-Object { $_.Name -notlike "C:*" } | Remove-CimInstance -ErrorAction SilentlyContinue
-    Write-Output "PAGEFILE=managed_on_C"
+    if ($needConvert) {
+      if ($cs.AutomaticManagedPagefile) { $cs | Set-CimInstance -Property @{AutomaticManagedPagefile=$false} | Out-Null }
+      Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue | Remove-CimInstance -ErrorAction SilentlyContinue
+      Write-Output "PAGEFILE=disabled_until_gpt"
+    } else {
+      if (-not $cs.AutomaticManagedPagefile) { $cs | Set-CimInstance -Property @{AutomaticManagedPagefile=$true} | Out-Null }
+      Get-CimInstance Win32_PageFileSetting -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike "C:*" } | Remove-CimInstance -ErrorAction SilentlyContinue
+      Write-Output "PAGEFILE=managed_on_C"
+    }
   } catch { Write-Output ("PAGEFILE=ERROR:" + $_.Exception.Message) }
   # 2) Gen1(MBR/BIOS) -> GPT/EFI with in-box MBR2GPT while still on Gen1 (WS2016 has no tool;
   #    disable BitLocker first). Azure does NOT auto-run this; Gen2 needs GPT/EFI.
   try {
-    # Detect the ACTUAL partition style of the OS disk (the one holding C:). The firmware
-    # registry value is unreliable on a Gen1 VM whose disk was already converted, so rely on
-    # the partition table + presence of an EFI System Partition (ESP) instead.
-    $osNum = (Get-Partition -DriveLetter C -ErrorAction SilentlyContinue).DiskNumber
-    if ($null -eq $osNum) { $osNum = 0 }
-    $style = (Get-Disk -Number $osNum -ErrorAction SilentlyContinue).PartitionStyle
-    $esp = @(Get-Partition -DiskNumber $osNum -ErrorAction SilentlyContinue | Where-Object { $_.GptType -eq "{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}" -or $_.Type -eq "System" })
-    Write-Output ("OSDISK=num:" + $osNum + " style:" + $style + " esp:" + $esp.Count)
     if ($style -eq "GPT" -and $esp.Count -ge 1) { Write-Output "MBR2GPT=ALREADY_GPT" }
     elseif ($style -eq "GPT") { Write-Output "MBR2GPT=GPT_NO_ESP" }
     else {
@@ -331,28 +346,47 @@ GUEST_PREP_PS='
 
         # mbr2gpt must carve an ~100MB EFI System Partition out of the disk. In full-OS mode it
         # cannot reuse the existing "System Reserved" partition, so it tries to shrink C: itself -
-        # and that shrink fails when immovable files sit at the end of the volume, logged as
-        # "Partition final size is <n> (initial size was <n>), cannot rely on this space".
-        # Free space INSIDE C: does not help; the space must be UNALLOCATED. So create it here.
+        # and that shrink returns 0 bytes when immovable files sit at the end of the volume
+        # ("Partition final size is <n> (initial size was <n>), cannot rely on this space").
+        # Free space INSIDE C: does not help; the space must be UNALLOCATED. So create it here,
+        # after removing the three things that make an online shrink impossible: the pagefile
+        # (already removed above), the hibernation file, and Volume Shadow Copies.
+        $needReboot = $false
         try {
           $dsk = Get-Disk -Number $osNum
           $unalloc = $dsk.Size - $dsk.AllocatedSize
           Write-Output ("UNALLOC_MB=" + [math]::Round($unalloc/1MB,0))
           if ($unalloc -lt 300MB) {
-            $cp = Get-Partition -DriveLetter C
-            $sup = Get-PartitionSupportedSize -DiskNumber $osNum -PartitionNumber $cp.PartitionNumber
-            $head = $cp.Size - $sup.SizeMin
-            Write-Output ("SHRINK_HEADROOM_MB=" + [math]::Round($head/1MB,0))
-            if ($head -gt 600MB) {
-              try {
-                Resize-Partition -DiskNumber $osNum -PartitionNumber $cp.PartitionNumber -Size ($cp.Size - 500MB) -ErrorAction Stop
-                $dsk = Get-Disk -Number $osNum
-                Write-Output ("SHRINK=OK new_unallocMB:" + [math]::Round(($dsk.Size - $dsk.AllocatedSize)/1MB,0))
-              } catch { Write-Output ("SHRINK=FAIL:" + $_.Exception.Message) }
-            } else { Write-Output "SHRINK=BLOCKED_IMMOVABLE" }
+            try { & "$env:SystemRoot\System32\powercfg.exe" -h off 2>&1 | Out-Null; Write-Output "HIBER=off" } catch { Write-Output ("HIBER=ERROR:" + $_.Exception.Message) }
+            try { & "$env:SystemRoot\System32\vssadmin.exe" delete shadows /all /quiet 2>&1 | Out-Null; Write-Output "SHADOWS=deleted" } catch { Write-Output ("SHADOWS=ERROR:" + $_.Exception.Message) }
+            $pf = @(Get-ChildItem -Force -Path "C:\" -Filter "pagefile.sys" -ErrorAction SilentlyContinue).Count
+            $hf = @(Get-ChildItem -Force -Path "C:\" -Filter "hiberfil.sys" -ErrorAction SilentlyContinue).Count
+            Write-Output ("IMMOVABLE=pagefile:" + $pf + " hiberfil:" + $hf)
+            # diskpart is markedly more reliable than Resize-Partition for an ONLINE NTFS shrink
+            # (Resize-Partition validates against Get-PartitionSupportedSize, which reports the
+            # theoretical minimum and happily rejects a valid request with "Size Not Supported").
+            # diskpart also tells us exactly how many MB it managed to free.
+            $dpf = Join-Path $env:TEMP "mig-shrink-c.txt"
+            Set-Content -Path $dpf -Value @("select volume C","shrink desired=1024 minimum=260","exit") -Encoding Ascii
+            $dpo = & "$env:SystemRoot\System32\diskpart.exe" /s $dpf 2>&1
+            Remove-Item $dpf -Force -ErrorAction SilentlyContinue
+            Write-Output ("DISKPART=" + (($dpo | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
+            $dsk = Get-Disk -Number $osNum
+            $unalloc = $dsk.Size - $dsk.AllocatedSize
+            Write-Output ("UNALLOC_MB_AFTER=" + [math]::Round($unalloc/1MB,0))
+            if ($unalloc -lt 260MB) {
+              if ($pf -gt 0 -or $hf -gt 0) {
+                # pagefile.sys / hiberfil.sys are only really released at the next boot. One
+                # restart and a re-run of this script is all that is needed.
+                Write-Output "SHRINK=NEED_REBOOT"
+                $needReboot = $true
+              } else { Write-Output "SHRINK=BLOCKED_IMMOVABLE" }
+            } else { Write-Output "SHRINK=OK" }
           } else { Write-Output "SHRINK=NOT_NEEDED" }
         } catch { Write-Output ("SHRINK=ERROR:" + $_.Exception.Message) }
 
+        if ($needReboot) { Write-Output "MBR2GPT=NEED_REBOOT" }
+        else {
         # Run /validate FIRST. A defrag is only needed when validate complains, and a defrag of a
         # production C: can take 20-60 minutes - so we no longer pay that cost unconditionally.
         $mv = & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1
@@ -373,7 +407,16 @@ GUEST_PREP_PS='
           if ($LASTEXITCODE -ne 0) {
             Write-Output "MBR2GPT=CONVERT_FAIL"
             Emit-Mbr2GptDiag $mc
-          } else { Write-Output "MBR2GPT=CONVERTED" }
+          } else {
+            Write-Output "MBR2GPT=CONVERTED"
+            # Disk is GPT now, so give the guest its pagefile back (system-managed on C:).
+            try {
+              $cs2 = Get-CimInstance Win32_ComputerSystem
+              $cs2 | Set-CimInstance -Property @{AutomaticManagedPagefile=$true} | Out-Null
+              Write-Output "PAGEFILE=restored_managed_on_C"
+            } catch { Write-Output ("PAGEFILE=RESTORE_ERROR:" + $_.Exception.Message) }
+          }
+        }
         }
       }
     }
@@ -388,6 +431,12 @@ GUEST_PREP_PS='
   } catch { Write-Output ("STORNVME=ERROR:" + $_.Exception.Message) }
 '
 
+# The in-guest prep may need exactly ONE restart: pagefile.sys and hiberfil.sys are only released
+# at the next boot, and until they are gone Windows cannot shrink C: to make room for the EFI
+# partition. When the guest asks for it we restart the VM and run the prep again - at most once.
+PREP_ATTEMPT=0
+while :; do
+PREP_ATTEMPT=$((PREP_ATTEMPT+1))
 if [ "$DRYRUN" = 1 ]; then
   printf '   %s[dry-run]%s az vm run-command invoke -g %s -n %s --command-id RunPowerShellScript --scripts <guest-prep>\n' "$c_wn" "$c_reset" "$RG" "$VM"
   PREP=""
@@ -417,8 +466,8 @@ else
       fi
     done
     wait "$PREP_PID" 2>/dev/null
-    PREP=$(cat "$PREP_FILE" 2>/dev/null)
-    PREP_ERRTXT=$(cat "$PREP_ERR" 2>/dev/null)
+    PREP=$(tr -d '\000' <"$PREP_FILE" 2>/dev/null)
+    PREP_ERRTXT=$(tr -d '\000' <"$PREP_ERR" 2>/dev/null)
     rm -f "$PREP_FILE" "$PREP_ERR" 2>/dev/null
 
     # A previous (interrupted) run is still executing in the guest -> wait for it, do not fail.
@@ -456,11 +505,31 @@ if [ "$DRYRUN" != 1 ]; then
     fi
     die "The in-guest preparation did not finish (see the partial output above)." "The guest script stopped before completing all steps. Copy the full output above and send it to us so we can pinpoint the failing step, then re-run."
   fi
+  # The guest could not shrink C: because pagefile.sys / hiberfil.sys are still open. They have
+  # just been de-configured, so ONE restart releases them. Do it here and run the prep again.
+  if grep -q "MBR2GPT=NEED_REBOOT" <<<"$PREP"; then
+    if [ "$PREP_ATTEMPT" -ge 2 ]; then
+      die "Even after a restart, C: could not be shrunk to make room for the EFI partition." "The pagefile and hibernation file are already disabled and shadow copies deleted, yet Windows still reports no shrinkable space (see the DISKPART= / UNALLOC_MB_AFTER= lines above). Send us those lines: the remaining blocker is usually a third-party agent (backup/AV/dedup) holding an immovable file at the end of C:. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point."
+    fi
+    warn "C: has no unallocated space and could not be shrunk yet: pagefile.sys/hiberfil.sys are"
+    warn "still in use. They have just been DISABLED, and a restart is required to release them."
+    warn "This is a normal, reversible Windows reboot - no data is touched. A system-managed"
+    warn "pagefile on C: is restored automatically once the disk is GPT."
+    confirm "Restart Windows now so the pagefile is released, then continue automatically?"
+    step "Restarting the VM..."
+    run az vm restart -g "$RG" -n "$VM" -o none
+    if ! wait_boot 40; then
+      die "The VM did not report back after the restart." "Check the VM in the portal; once it is running and the guest agent is 'Ready', simply re-run this script - it is safe to re-run and resumes where it stopped. Snapshot '$SNAPSHOT' remains your rollback point."
+    fi
+    ok "VM restarted and responding - re-running the guest prep (attempt 2/2)."
+    continue
+  fi
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
+    *SHRINK=BLOCKED_IMMOVABLE*) die "Windows could not free any unallocated space on the OS disk." "The pagefile and hibernation file are gone and shadow copies were deleted, but the shrink still returned nothing (see DISKPART= / UNALLOC_MB_AFTER= above). Send us those lines. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *VALIDATE_FAIL*)  die "mbr2gpt /validate failed (details captured above: MBR2GPT_OUT / SETUPACT / DISK0 / PART lines)." "Send us those lines - they name the exact reason. Most common: >3 primary partitions, or no room for the ~100MB EFI system partition. Do NOT proceed; we'll advise the targeted fix.";;
-    *CONVERT_FAIL*)   die "mbr2gpt /convert failed (diagnostics captured above)." "mbr2gpt validated the disk but could not create the ~100MB EFI partition. Look at the SETUPACT lines: 'Partition final size is <n> (initial size was <n>), cannot rely on this space' means it could not shrink C: because immovable files (pagefile, shadow copies, hibernation) sit at the end of the volume. Free space INSIDE C: does not help - the space must be UNALLOCATED. Fix: disable the pagefile, delete shadow copies, REBOOT, then re-run this script (it will shrink C: automatically). Send us the SHRINK=/UNALLOC_MB= lines if unsure.";;
+    *CONVERT_FAIL*)   die "mbr2gpt /convert failed (diagnostics captured above)." "mbr2gpt validated the disk but could not create the ~100MB EFI partition. Look at the SETUPACT lines: 'Partition final size is <n> (initial size was <n>), cannot rely on this space' means it could not shrink C: because immovable files sit at the end of the volume. Free space INSIDE C: does not help - the space must be UNALLOCATED. Send us the UNALLOC_MB / DISKPART / IMMOVABLE lines above. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
     *GPT_NO_ESP*)     die "The OS disk is GPT but has no EFI System Partition." "Unusual layout - send us the OSDISK/PART lines above so we can add the ESP before the Gen2 flip.";;
     *STORNVME=MISSING*) die "StorNVMe driver missing (very old image)." "Update the guest to WS2019+, then re-run.";;
@@ -468,6 +537,8 @@ if [ "$DRYRUN" != 1 ]; then
   esac
   ok "Guest prep applied (pagefile on C:; MBR->GPT done or already GPT; StorNVMe boot-start set)."
 fi
+break
+done
 mark "Guest prepared (pagefile-on-C, GPT/EFI, NVMe-ready)"; recap
 confirm "Guest prep looks good. Proceed to convert the VM to Gen2 (Trusted Launch)?"
 
