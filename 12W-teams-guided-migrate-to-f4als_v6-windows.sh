@@ -280,7 +280,8 @@ warn "This step runs INSIDE Windows and is the SLOWEST part of the migration."
 warn "mbr2gpt (and a defrag, if one is needed) can take 20-60 minutes on a busy production C:."
 warn "A progress line is printed every 20s. DO NOT press Ctrl-C and DO NOT close this window."
 warn "If the OS disk is still MBR, the pagefile is removed for the duration of the conversion so"
-warn "that C: can be shrunk; you may be asked for ONE Windows restart, then it continues by itself."
+warn "that C: can be shrunk. If Windows still cannot free space, the script offers to GROW the OS"
+warn "disk by a few hundred MB from Azure (metadata-only, no data touched) and continues by itself."
 warn "A system-managed pagefile on C: is restored automatically once the disk is GPT."
 step "Running in-guest prep (expect 5-60 min; progress is printed below)..."
 # shellcheck disable=SC2016  # the PowerShell must run inside the guest, not expand locally
@@ -351,7 +352,7 @@ GUEST_PREP_PS='
         # Free space INSIDE C: does not help; the space must be UNALLOCATED. So create it here,
         # after removing the three things that make an online shrink impossible: the pagefile
         # (already removed above), the hibernation file, and Volume Shadow Copies.
-        $needReboot = $false
+        $needSpace = $false
         try {
           $dsk = Get-Disk -Number $osNum
           $unalloc = $dsk.Size - $dsk.AllocatedSize
@@ -375,17 +376,18 @@ GUEST_PREP_PS='
             $unalloc = $dsk.Size - $dsk.AllocatedSize
             Write-Output ("UNALLOC_MB_AFTER=" + [math]::Round($unalloc/1MB,0))
             if ($unalloc -lt 260MB) {
-              if ($pf -gt 0 -or $hf -gt 0) {
-                # pagefile.sys / hiberfil.sys are only really released at the next boot. One
-                # restart and a re-run of this script is all that is needed.
-                Write-Output "SHRINK=NEED_REBOOT"
-                $needReboot = $true
-              } else { Write-Output "SHRINK=BLOCKED_IMMOVABLE" }
+              # Nothing could be freed from inside Windows (immovable files, and pagefile.sys /
+              # hiberfil.sys are only really released at the next boot). The reliable fix is to
+              # ADD space from the Azure side by growing the managed disk: that is a metadata-only
+              # operation which never touches the file system, and the new space lands right after
+              # C: - exactly where mbr2gpt wants to create the EFI partition.
+              Write-Output "SHRINK=NEED_SPACE"
+              $needSpace = $true
             } else { Write-Output "SHRINK=OK" }
           } else { Write-Output "SHRINK=NOT_NEEDED" }
         } catch { Write-Output ("SHRINK=ERROR:" + $_.Exception.Message) }
 
-        if ($needReboot) { Write-Output "MBR2GPT=NEED_REBOOT" }
+        if ($needSpace) { Write-Output "MBR2GPT=NEED_SPACE" }
         else {
         # Run /validate FIRST. A defrag is only needed when validate complains, and a defrag of a
         # production C: can take 20-60 minutes - so we no longer pay that cost unconditionally.
@@ -505,21 +507,51 @@ if [ "$DRYRUN" != 1 ]; then
     fi
     die "The in-guest preparation did not finish (see the partial output above)." "The guest script stopped before completing all steps. Copy the full output above and send it to us so we can pinpoint the failing step, then re-run."
   fi
-  # The guest could not shrink C: because pagefile.sys / hiberfil.sys are still open. They have
-  # just been de-configured, so ONE restart releases them. Do it here and run the prep again.
-  if grep -q "MBR2GPT=NEED_REBOOT" <<<"$PREP"; then
+  # Windows could not free any unallocated space on the OS disk. Add it from the Azure side
+  # instead: growing the managed disk is a metadata-only operation (no file system is touched,
+  # no data is moved) and the new space appears right after C:, exactly where mbr2gpt wants to
+  # create the EFI System Partition. The VM must be deallocated for an OS-disk resize.
+  if grep -q "MBR2GPT=NEED_SPACE" <<<"$PREP"; then
     if [ "$PREP_ATTEMPT" -ge 2 ]; then
-      die "Even after a restart, C: could not be shrunk to make room for the EFI partition." "The pagefile and hibernation file are already disabled and shadow copies deleted, yet Windows still reports no shrinkable space (see the DISKPART= / UNALLOC_MB_AFTER= lines above). Send us those lines: the remaining blocker is usually a third-party agent (backup/AV/dedup) holding an immovable file at the end of C:. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point."
+      die "Even after growing the OS disk, mbr2gpt still reports no room for the EFI partition." "Send us the UNALLOC_MB / UNALLOC_MB_AFTER / DISKPART / PART lines above. NOTHING destructive has run - the VM still boots and snapshot '$SNAPSHOT' remains your rollback point."
     fi
-    warn "C: has no unallocated space and could not be shrunk yet: pagefile.sys/hiberfil.sys are"
-    warn "still in use. They have just been DISABLED, and a restart is required to release them."
-    warn "This is a normal, reversible Windows reboot - no data is touched. A system-managed"
-    warn "pagefile on C: is restored automatically once the disk is GPT."
-    confirm "Restart Windows now so the pagefile is released, then continue automatically?"
-    step "Restarting the VM..."
-    run az vm restart -g "$RG" -n "$VM" -o none
+    CUR_GB=$(az disk show -g "$RG" -n "$OSDISK" --query diskSizeGb -o tsv 2>/dev/null || echo "")
+    [ -n "$CUR_GB" ] || die "Could not read the current size of OS disk '$OSDISK'." "Check your permissions on the disk, then re-run."
+    # Stay inside the current billing tier when possible: Premium/Standard SSD are billed per
+    # tier (.. 64, 128, 256 ..GiB), so growing 127 -> 128 GiB costs nothing extra.
+    NEW_GB=""
+    for t in 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32767; do
+      if [ "$t" -gt "$CUR_GB" ]; then NEW_GB="$t"; break; fi
+    done
+    SAME_TIER=1
+    if [ -z "$NEW_GB" ] || [ "$((NEW_GB - CUR_GB))" -gt 8 ]; then NEW_GB=$((CUR_GB + 1)); SAME_TIER=0; fi
+    warn "Windows cannot free any unallocated space on the OS disk (immovable files at the end of C:)."
+    warn "The safe fix is to GROW the OS disk from Azure: ${CUR_GB} GiB -> ${NEW_GB} GiB."
+    warn "This is a metadata-only change: no file system is touched and no data is moved or resized."
+    if [ "$SAME_TIER" = 1 ]; then
+      warn "${NEW_GB} GiB is the top of the CURRENT billing tier, so there is NO additional cost."
+    else
+      warn "NOTE: the disk is already at a tier boundary, so +1 GiB moves it to the next billing"
+      warn "tier. Confirm with the disk owner if cost matters, or answer 'n' and contact us."
+    fi
+    warn "An OS-disk resize requires the VM to be deallocated: the VM will be stopped and restarted."
+    confirm "Grow the OS disk to ${NEW_GB} GiB (stop + resize + start), then continue automatically?"
+    step "Deallocating the VM (required to resize an OS disk)..."
+    run az vm deallocate -g "$RG" -n "$VM" -o none
+    step "Growing '$OSDISK' from ${CUR_GB} GiB to ${NEW_GB} GiB..."
+    run az disk update -g "$RG" -n "$OSDISK" --size-gb "$NEW_GB" -o none
+    CHK_GB=$(az disk show -g "$RG" -n "$OSDISK" --query diskSizeGb -o tsv 2>/dev/null || echo "")
+    if [ "$CHK_GB" != "$NEW_GB" ]; then
+      bad "The OS disk is still ${CHK_GB:-unknown} GiB - the resize did not apply."
+      step "Starting the VM again so it is left running..."
+      run az vm start -g "$RG" -n "$VM" -o none
+      die "Could not grow the OS disk." "Grow '$OSDISK' to ${NEW_GB} GiB manually (portal: Disk > Size + performance) while the VM is deallocated, then re-run this script. Snapshot '$SNAPSHOT' remains your rollback point."
+    fi
+    ok "OS disk is now ${NEW_GB} GiB - ~$(( (NEW_GB - CUR_GB) * 1024 ))MB of unallocated space is available for the EFI partition."
+    step "Starting the VM..."
+    run az vm start -g "$RG" -n "$VM" -o none
     if ! wait_boot 40; then
-      die "The VM did not report back after the restart." "Check the VM in the portal; once it is running and the guest agent is 'Ready', simply re-run this script - it is safe to re-run and resumes where it stopped. Snapshot '$SNAPSHOT' remains your rollback point."
+      die "The VM did not report back after the resize." "Check it in the portal; once it is running and the guest agent is 'Ready', simply re-run this script - it is safe to re-run and resumes where it stopped. Snapshot '$SNAPSHOT' remains your rollback point."
     fi
     ok "VM restarted and responding - re-running the guest prep (attempt 2/2)."
     continue
@@ -527,7 +559,6 @@ if [ "$DRYRUN" != 1 ]; then
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
-    *SHRINK=BLOCKED_IMMOVABLE*) die "Windows could not free any unallocated space on the OS disk." "The pagefile and hibernation file are gone and shadow copies were deleted, but the shrink still returned nothing (see DISKPART= / UNALLOC_MB_AFTER= above). Send us those lines. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *VALIDATE_FAIL*)  die "mbr2gpt /validate failed (details captured above: MBR2GPT_OUT / SETUPACT / DISK0 / PART lines)." "Send us those lines - they name the exact reason. Most common: >3 primary partitions, or no room for the ~100MB EFI system partition. Do NOT proceed; we'll advise the targeted fix.";;
     *CONVERT_FAIL*)   die "mbr2gpt /convert failed (diagnostics captured above)." "mbr2gpt validated the disk but could not create the ~100MB EFI partition. Look at the SETUPACT lines: 'Partition final size is <n> (initial size was <n>), cannot rely on this space' means it could not shrink C: because immovable files sit at the end of the volume. Free space INSIDE C: does not help - the space must be UNALLOCATED. Send us the UNALLOC_MB / DISKPART / IMMOVABLE lines above. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
