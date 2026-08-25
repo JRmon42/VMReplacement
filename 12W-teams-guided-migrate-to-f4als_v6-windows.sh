@@ -318,6 +318,9 @@ GUEST_PREP_PS='
         # production C: can take 20-60 minutes - so we no longer pay that cost unconditionally.
         $mv = & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1
         if ($LASTEXITCODE -ne 0) {
+          # Report WHY the first attempt failed before spending 20-60 min on a defrag, so the
+          # reason is known even if the operator loses the session during the retry.
+          Write-Output ("MBR2GPT_OUT1=" + (($mv | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
           Write-Output "MBR2GPT=DEFRAG_THEN_RETRY"
           Defrag C: /U 2>&1 | Out-Null
           $mv = & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1
@@ -329,8 +332,10 @@ GUEST_PREP_PS='
           foreach ($l in $lg) { Write-Output ("SETUPACT: " + $l.Line.Trim()) }
           try {
             $d0 = Get-Disk -Number $osNum
-            Write-Output ("DISK0=style:" + $d0.PartitionStyle + " parts:" + (Get-Partition -DiskNumber $osNum | Measure-Object).Count)
-            foreach ($p in (Get-Partition -DiskNumber $osNum)) { Write-Output ("PART: n=" + $p.PartitionNumber + " type=" + $p.Type + " size=" + [math]::Round($p.Size/1GB,2) + "GB drive=" + $p.DriveLetter) }
+            Write-Output ("DISK0=style:" + $d0.PartitionStyle + " parts:" + (Get-Partition -DiskNumber $osNum | Measure-Object).Count + " unallocGB:" + [math]::Round(($d0.Size - $d0.AllocatedSize)/1GB,3))
+            foreach ($p in (Get-Partition -DiskNumber $osNum)) { Write-Output ("PART: n=" + $p.PartitionNumber + " type=" + $p.Type + " size=" + [math]::Round($p.Size/1GB,2) + "GB offset=" + [math]::Round($p.Offset/1GB,3) + "GB drive=" + $p.DriveLetter) }
+            $cv = Get-Volume -DriveLetter C -ErrorAction SilentlyContinue
+            if ($cv) { Write-Output ("CVOL: sizeGB=" + [math]::Round($cv.Size/1GB,2) + " freeGB=" + [math]::Round($cv.SizeRemaining/1GB,2)) }
           } catch {}
         }
         else {
