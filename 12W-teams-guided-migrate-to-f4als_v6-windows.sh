@@ -314,6 +314,45 @@ GUEST_PREP_PS='
       if ($bl -and $bl.ProtectionStatus -eq "On") { Write-Output "MBR2GPT=BITLOCKER_ON" }
       elseif (-not (Test-Path "$env:SystemRoot\System32\mbr2gpt.exe")) { Write-Output "MBR2GPT=NO_TOOL_WS2016" }
       else {
+        # Shared failure diagnostics: mbr2gpt output, the MBR2GPT lines it wrote to setupact.log,
+        # and the real partition layout (including unallocated space, the usual culprit).
+        function Emit-Mbr2GptDiag($out) {
+          Write-Output ("MBR2GPT_OUT=" + (($out | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
+          $lg = Get-Content "$env:SystemRoot\setupact.log" -ErrorAction SilentlyContinue | Select-String -Pattern "MBR2GPT" | Select-Object -Last 20
+          foreach ($l in $lg) { Write-Output ("SETUPACT: " + $l.Line.Trim()) }
+          try {
+            $dd = Get-Disk -Number $osNum
+            Write-Output ("DISK0=style:" + $dd.PartitionStyle + " parts:" + (Get-Partition -DiskNumber $osNum | Measure-Object).Count + " unallocMB:" + [math]::Round(($dd.Size - $dd.AllocatedSize)/1MB,0))
+            foreach ($p in (Get-Partition -DiskNumber $osNum)) { Write-Output ("PART: n=" + $p.PartitionNumber + " type=" + $p.Type + " size=" + [math]::Round($p.Size/1GB,2) + "GB offset=" + [math]::Round($p.Offset/1GB,3) + "GB drive=" + $p.DriveLetter) }
+            $cv = Get-Volume -DriveLetter C -ErrorAction SilentlyContinue
+            if ($cv) { Write-Output ("CVOL: sizeGB=" + [math]::Round($cv.Size/1GB,2) + " freeGB=" + [math]::Round($cv.SizeRemaining/1GB,2)) }
+          } catch {}
+        }
+
+        # mbr2gpt must carve an ~100MB EFI System Partition out of the disk. In full-OS mode it
+        # cannot reuse the existing "System Reserved" partition, so it tries to shrink C: itself -
+        # and that shrink fails when immovable files sit at the end of the volume, logged as
+        # "Partition final size is <n> (initial size was <n>), cannot rely on this space".
+        # Free space INSIDE C: does not help; the space must be UNALLOCATED. So create it here.
+        try {
+          $dsk = Get-Disk -Number $osNum
+          $unalloc = $dsk.Size - $dsk.AllocatedSize
+          Write-Output ("UNALLOC_MB=" + [math]::Round($unalloc/1MB,0))
+          if ($unalloc -lt 300MB) {
+            $cp = Get-Partition -DriveLetter C
+            $sup = Get-PartitionSupportedSize -DiskNumber $osNum -PartitionNumber $cp.PartitionNumber
+            $head = $cp.Size - $sup.SizeMin
+            Write-Output ("SHRINK_HEADROOM_MB=" + [math]::Round($head/1MB,0))
+            if ($head -gt 600MB) {
+              try {
+                Resize-Partition -DiskNumber $osNum -PartitionNumber $cp.PartitionNumber -Size ($cp.Size - 500MB) -ErrorAction Stop
+                $dsk = Get-Disk -Number $osNum
+                Write-Output ("SHRINK=OK new_unallocMB:" + [math]::Round(($dsk.Size - $dsk.AllocatedSize)/1MB,0))
+              } catch { Write-Output ("SHRINK=FAIL:" + $_.Exception.Message) }
+            } else { Write-Output "SHRINK=BLOCKED_IMMOVABLE" }
+          } else { Write-Output "SHRINK=NOT_NEEDED" }
+        } catch { Write-Output ("SHRINK=ERROR:" + $_.Exception.Message) }
+
         # Run /validate FIRST. A defrag is only needed when validate complains, and a defrag of a
         # production C: can take 20-60 minutes - so we no longer pay that cost unconditionally.
         $mv = & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1
@@ -327,20 +366,14 @@ GUEST_PREP_PS='
         }
         if ($LASTEXITCODE -ne 0) {
           Write-Output "MBR2GPT=VALIDATE_FAIL"
-          Write-Output ("MBR2GPT_OUT=" + (($mv | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
-          $lg = Get-Content "$env:SystemRoot\setupact.log" -ErrorAction SilentlyContinue | Select-String -Pattern "MBR2GPT" | Select-Object -Last 20
-          foreach ($l in $lg) { Write-Output ("SETUPACT: " + $l.Line.Trim()) }
-          try {
-            $d0 = Get-Disk -Number $osNum
-            Write-Output ("DISK0=style:" + $d0.PartitionStyle + " parts:" + (Get-Partition -DiskNumber $osNum | Measure-Object).Count + " unallocGB:" + [math]::Round(($d0.Size - $d0.AllocatedSize)/1GB,3))
-            foreach ($p in (Get-Partition -DiskNumber $osNum)) { Write-Output ("PART: n=" + $p.PartitionNumber + " type=" + $p.Type + " size=" + [math]::Round($p.Size/1GB,2) + "GB offset=" + [math]::Round($p.Offset/1GB,3) + "GB drive=" + $p.DriveLetter) }
-            $cv = Get-Volume -DriveLetter C -ErrorAction SilentlyContinue
-            if ($cv) { Write-Output ("CVOL: sizeGB=" + [math]::Round($cv.Size/1GB,2) + " freeGB=" + [math]::Round($cv.SizeRemaining/1GB,2)) }
-          } catch {}
+          Emit-Mbr2GptDiag $mv
         }
         else {
-          & "$env:SystemRoot\System32\mbr2gpt.exe" /convert /allowFullOS 2>&1 | Out-Null
-          if ($LASTEXITCODE -ne 0) { Write-Output "MBR2GPT=CONVERT_FAIL" } else { Write-Output "MBR2GPT=CONVERTED" }
+          $mc = & "$env:SystemRoot\System32\mbr2gpt.exe" /convert /allowFullOS 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "MBR2GPT=CONVERT_FAIL"
+            Emit-Mbr2GptDiag $mc
+          } else { Write-Output "MBR2GPT=CONVERTED" }
         }
       }
     }
@@ -427,7 +460,7 @@ if [ "$DRYRUN" != 1 ]; then
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
     *VALIDATE_FAIL*)  die "mbr2gpt /validate failed (details captured above: MBR2GPT_OUT / SETUPACT / DISK0 / PART lines)." "Send us those lines - they name the exact reason. Most common: >3 primary partitions, or no room for the ~100MB EFI system partition. Do NOT proceed; we'll advise the targeted fix.";;
-    *CONVERT_FAIL*)   die "mbr2gpt /convert failed." "Review C:\\Windows\\setupact.log for MBR2GPT lines, then re-run.";;
+    *CONVERT_FAIL*)   die "mbr2gpt /convert failed (diagnostics captured above)." "mbr2gpt validated the disk but could not create the ~100MB EFI partition. Look at the SETUPACT lines: 'Partition final size is <n> (initial size was <n>), cannot rely on this space' means it could not shrink C: because immovable files (pagefile, shadow copies, hibernation) sit at the end of the volume. Free space INSIDE C: does not help - the space must be UNALLOCATED. Fix: disable the pagefile, delete shadow copies, REBOOT, then re-run this script (it will shrink C: automatically). Send us the SHRINK=/UNALLOC_MB= lines if unsure.";;
     *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
     *GPT_NO_ESP*)     die "The OS disk is GPT but has no EFI System Partition." "Unusual layout - send us the OSDISK/PART lines above so we can add the ESP before the Gen2 flip.";;
     *STORNVME=MISSING*) die "StorNVMe driver missing (very old image)." "Update the guest to WS2019+, then re-run.";;
