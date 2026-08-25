@@ -72,6 +72,10 @@
 #              REUSE_SNAPSHOT=0  force a brand-new snapshot instead of reusing the newest existing one
 #              ZONE         (availability zone for the rebuilt VM, e.g. 3; auto-detected)
 #              AUTO=1       run without pausing between phases (no prompts)
+#              PREP_TIMEOUT seconds to allow for the in-guest prep (default 4800 = 80 min).
+#                           STEP 3 runs mbr2gpt (and a defrag if needed) inside Windows and can
+#                           legitimately take 20-60 min on a busy production disk - it is NOT hung.
+#                           A progress line is printed every 20s; leave the window open.
 #              DRYRUN=1     print the state-changing az commands, do NOT run them
 #
 #   ROLLBACK (if anything looks wrong AFTER the rebuild): recreate the VM on the
@@ -89,6 +93,7 @@ ZONE="${ZONE:-}"
 AUTO="${AUTO:-0}"
 DRYRUN="${DRYRUN:-0}"
 BOOT_TRIES="${BOOT_TRIES:-40}"     # boot-health polls (x ~15s => ~10 min)
+PREP_TIMEOUT="${PREP_TIMEOUT:-4800}" # max seconds to wait for the in-guest prep (80 min; Azure caps run-command at 90)
 
 # ------------------------------ pretty output ------------------------------
 c_reset=$'\033[0m'; c_ok=$'\033[32m'; c_bad=$'\033[31m'; c_hd=$'\033[36m'; c_wn=$'\033[33m'
@@ -257,10 +262,14 @@ confirm "Snapshot done. Proceed to prepare the Windows guest?"
 
 # ============================== STEP: GUEST PREP ===========================
 phase "Prepare the Windows guest (pagefile off D:, MBR->GPT, NVMe driver), then VERIFY"
-step "Running in-guest prep (this can take a few minutes)..."
+warn "This step runs INSIDE Windows and is the SLOWEST part of the migration."
+warn "mbr2gpt (and a defrag, if one is needed) can take 20-60 minutes on a busy production C:."
+warn "A progress line is printed every 20s. DO NOT press Ctrl-C and DO NOT close this window."
+step "Running in-guest prep (expect 5-60 min; progress is printed below)..."
 # shellcheck disable=SC2016  # the PowerShell must run inside the guest, not expand locally
-PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts '
+GUEST_PREP_PS='
   $ErrorActionPreference = "Continue"
+  Write-Output "PREP_BEGIN"
   try { Write-Output ("OS=" + (Get-CimInstance Win32_OperatingSystem).Caption) } catch { Write-Output "OS=UNKNOWN" }
   # 1) Move the pagefile OFF the temp disk (D:) to a system-managed pagefile on C:, so nothing
   #    depends on the local temp disk that the diskless target removes.
@@ -291,8 +300,14 @@ PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShell
       if ($bl -and $bl.ProtectionStatus -eq "On") { Write-Output "MBR2GPT=BITLOCKER_ON" }
       elseif (-not (Test-Path "$env:SystemRoot\System32\mbr2gpt.exe")) { Write-Output "MBR2GPT=NO_TOOL_WS2016" }
       else {
-        Defrag C: /U 2>&1 | Out-Null
+        # Run /validate FIRST. A defrag is only needed when validate complains, and a defrag of a
+        # production C: can take 20-60 minutes - so we no longer pay that cost unconditionally.
         $mv = & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1
+        if ($LASTEXITCODE -ne 0) {
+          Write-Output "MBR2GPT=DEFRAG_THEN_RETRY"
+          Defrag C: /U 2>&1 | Out-Null
+          $mv = & "$env:SystemRoot\System32\mbr2gpt.exe" /validate /allowFullOS 2>&1
+        }
         if ($LASTEXITCODE -ne 0) {
           Write-Output "MBR2GPT=VALIDATE_FAIL"
           Write-Output ("MBR2GPT_OUT=" + (($mv | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
@@ -319,7 +334,41 @@ PREP=$(run az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShell
       Write-Output "STORNVME=OK"
     } else { Write-Output "STORNVME=MISSING" }
   } catch { Write-Output ("STORNVME=ERROR:" + $_.Exception.Message) }
-' --query "value[0].message" -o tsv 2>/dev/null || true)
+'
+
+if [ "$DRYRUN" = 1 ]; then
+  printf '   %s[dry-run]%s az vm run-command invoke -g %s -n %s --command-id RunPowerShellScript --scripts <guest-prep>\n' "$c_wn" "$c_reset" "$RG" "$VM"
+  PREP=""
+else
+  # Run the guest prep in the background so we can print a heartbeat. Two reasons this matters:
+  #  * Azure Cloud Shell closes a session after ~20 min without activity - a silent 30-minute
+  #    mbr2gpt would kill the shell mid-migration.
+  #  * The operator can otherwise not tell "slow" from "hung".
+  PREP_FILE=$(mktemp 2>/dev/null || echo "/tmp/prep.$$")
+  PREP_ERR=$(mktemp 2>/dev/null || echo "/tmp/preperr.$$")
+  az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
+      --scripts "$GUEST_PREP_PS" --query "value[0].message" -o tsv >"$PREP_FILE" 2>"$PREP_ERR" &
+  PREP_PID=$!
+  PREP_T0=$SECONDS
+  while kill -0 "$PREP_PID" 2>/dev/null; do
+    sleep 20
+    PREP_EL=$((SECONDS-PREP_T0))
+    printf '        ...still working inside Windows (%02d:%02d elapsed, this is normal)\n' $((PREP_EL/60)) $((PREP_EL%60))
+    if [ "$PREP_EL" -ge "$PREP_TIMEOUT" ]; then
+      kill "$PREP_PID" 2>/dev/null
+      die "The in-guest prep exceeded ${PREP_TIMEOUT}s without finishing." "Azure's run-command has a hard 90-minute limit. Check the VM's CPU/disk metrics in the portal - if it is still busy, re-run with a bigger PREP_TIMEOUT. NOTHING destructive has run: the VM and the OS disk are unchanged and snapshot '$SNAPSHOT' is your rollback point."
+    fi
+  done
+  wait "$PREP_PID" 2>/dev/null
+  PREP=$(cat "$PREP_FILE" 2>/dev/null)
+  # Surface the az error instead of swallowing it - a silent empty result used to hide the cause.
+  if [ -s "$PREP_ERR" ]; then
+    warn "Azure reported the following while running the in-guest prep:"
+    sed 's/^/        /' "$PREP_ERR"
+  fi
+  rm -f "$PREP_FILE" "$PREP_ERR" 2>/dev/null
+  step "In-guest prep call returned after $(( (SECONDS-PREP_T0)/60 ))m $(( (SECONDS-PREP_T0)%60 ))s."
+fi
 [ "$DRYRUN" != 1 ] && printf '%s\n' "$PREP" | sed 's/^/        /'
 
 if [ "$DRYRUN" != 1 ]; then
@@ -329,7 +378,7 @@ if [ "$DRYRUN" != 1 ]; then
   # (has some markers but not the final STORNVME=). Either way we must not proceed.
   if ! grep -q "STORNVME=" <<<"$PREP"; then
     if [ -z "${PREP//[[:space:]]/}" ]; then
-      die "The in-guest preparation returned no result." "The Azure VM guest agent did not run the script (VM still booting, agent unhealthy, or run-command blocked). Confirm the VM is running and the guest agent is 'Ready' in the portal, then re-run."
+      die "The in-guest preparation returned no result." "The Azure VM guest agent did not run the script (VM still booting, agent unhealthy, run-command blocked, or the Cloud Shell session expired mid-run). Confirm the VM is running and the guest agent is 'Ready' in the portal, then simply re-run this script - it is safe to re-run and will skip anything already done."
     fi
     die "The in-guest preparation did not finish (see the partial output above)." "The guest script stopped before completing all steps. Copy the full output above and send it to us so we can pinpoint the failing step, then re-run."
   fi
