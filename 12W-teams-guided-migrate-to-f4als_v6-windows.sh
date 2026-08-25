@@ -118,6 +118,20 @@ DONE=()
 mark(){ DONE+=("$1"); }
 recap(){ printf '\n%s--- checklist so far ---%s\n' "$c_hd" "$c_reset"; local i; for i in "${DONE[@]}"; do printf '   [x] %s\n' "$i"; done; }
 
+# Ctrl-C does NOT stop the work happening inside Windows: run-command scripts are executed by the
+# Azure guest agent, so they keep going. Explain that rather than leaving a bare shell prompt.
+on_interrupt(){
+  printf '\n\n%s!!! INTERRUPTED (Ctrl-C) !!!%s\n' "$c_bad" "$c_reset"
+  printf '   This stopped only the command on YOUR side. If the in-guest preparation was running,\n'
+  printf '   it is STILL RUNNING inside Windows and will finish on its own.\n'
+  printf '   * Do NOT reboot, stop, resize or delete the VM now.\n'
+  printf '   * Wait a few minutes, then simply re-run this script - it is safe to re-run and will\n'
+  printf '     wait for the in-guest script to finish, then skip whatever is already done.\n'
+  printf '   * Nothing destructive has been performed by this script.\n\n'
+  exit 130
+}
+trap on_interrupt INT
+
 # in-guest PowerShell readiness probe. Echoes KEY=VALUE lines (BOOT_OK proves the OS booted).
 guest_probe(){
   # shellcheck disable=SC2016  # the PowerShell must run inside the guest, not expand locally
@@ -340,33 +354,55 @@ if [ "$DRYRUN" = 1 ]; then
   printf '   %s[dry-run]%s az vm run-command invoke -g %s -n %s --command-id RunPowerShellScript --scripts <guest-prep>\n' "$c_wn" "$c_reset" "$RG" "$VM"
   PREP=""
 else
-  # Run the guest prep in the background so we can print a heartbeat. Two reasons this matters:
+  # Run the guest prep in the background so we can print a heartbeat. Three reasons this matters:
   #  * Azure Cloud Shell closes a session after ~20 min without activity - a silent 30-minute
   #    mbr2gpt would kill the shell mid-migration.
   #  * The operator can otherwise not tell "slow" from "hung".
-  PREP_FILE=$(mktemp 2>/dev/null || echo "/tmp/prep.$$")
-  PREP_ERR=$(mktemp 2>/dev/null || echo "/tmp/preperr.$$")
-  az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
-      --scripts "$GUEST_PREP_PS" --query "value[0].message" -o tsv >"$PREP_FILE" 2>"$PREP_ERR" &
-  PREP_PID=$!
+  #  * If a PREVIOUS run of this script was interrupted (e.g. Ctrl-C), its script is STILL running
+  #    inside the guest - Ctrl-C only kills the local CLI, not the guest agent. Azure allows one
+  #    run-command at a time per VM, so we must wait for it instead of failing with a Conflict.
   PREP_T0=$SECONDS
-  while kill -0 "$PREP_PID" 2>/dev/null; do
-    sleep 20
-    PREP_EL=$((SECONDS-PREP_T0))
-    printf '        ...still working inside Windows (%02d:%02d elapsed, this is normal)\n' $((PREP_EL/60)) $((PREP_EL%60))
-    if [ "$PREP_EL" -ge "$PREP_TIMEOUT" ]; then
-      kill "$PREP_PID" 2>/dev/null
-      die "The in-guest prep exceeded ${PREP_TIMEOUT}s without finishing." "Azure's run-command has a hard 90-minute limit. Check the VM's CPU/disk metrics in the portal - if it is still busy, re-run with a bigger PREP_TIMEOUT. NOTHING destructive has run: the VM and the OS disk are unchanged and snapshot '$SNAPSHOT' is your rollback point."
+  PREP=""
+  while :; do
+    PREP_FILE=$(mktemp 2>/dev/null || echo "/tmp/prep.$$")
+    PREP_ERR=$(mktemp 2>/dev/null || echo "/tmp/preperr.$$")
+    az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
+        --scripts "$GUEST_PREP_PS" --query "value[0].message" -o tsv >"$PREP_FILE" 2>"$PREP_ERR" &
+    PREP_PID=$!
+    while kill -0 "$PREP_PID" 2>/dev/null; do
+      sleep 20
+      PREP_EL=$((SECONDS-PREP_T0))
+      printf '        ...still working inside Windows (%02d:%02d elapsed, this is normal)\n' $((PREP_EL/60)) $((PREP_EL%60))
+      if [ "$PREP_EL" -ge "$PREP_TIMEOUT" ]; then
+        kill "$PREP_PID" 2>/dev/null
+        die "The in-guest prep exceeded ${PREP_TIMEOUT}s without finishing." "Azure's run-command has a hard 90-minute limit. Check the VM's CPU/disk metrics in the portal - if it is still busy, re-run with a bigger PREP_TIMEOUT. NOTHING destructive has run: the VM and the OS disk are unchanged and snapshot '$SNAPSHOT' is your rollback point."
+      fi
+    done
+    wait "$PREP_PID" 2>/dev/null
+    PREP=$(cat "$PREP_FILE" 2>/dev/null)
+    PREP_ERRTXT=$(cat "$PREP_ERR" 2>/dev/null)
+    rm -f "$PREP_FILE" "$PREP_ERR" 2>/dev/null
+
+    # A previous (interrupted) run is still executing in the guest -> wait for it, do not fail.
+    if [ -z "${PREP//[[:space:]]/}" ] && grep -qiE 'in progress|conflict|already running' <<<"$PREP_ERRTXT"; then
+      warn "Another run-command is STILL EXECUTING inside this VM."
+      warn "This is normal if a previous run of this script was interrupted with Ctrl-C: that stops"
+      warn "only the local command, not the script inside Windows, which keeps converting the disk."
+      warn "Waiting 60s and retrying. Do NOT reboot, stop or resize the VM while this is in progress."
+      sleep 60
+      if [ $((SECONDS-PREP_T0)) -ge "$PREP_TIMEOUT" ]; then
+        die "Still blocked by a previous in-guest run after ${PREP_TIMEOUT}s." "Wait for the earlier run to finish (watch CPU/disk metrics in the portal) and re-run this script. Do NOT reboot the VM. NOTHING destructive has run: snapshot '$SNAPSHOT' remains your rollback point."
+      fi
+      continue
     fi
+
+    # Surface the az error instead of swallowing it - a silent empty result used to hide the cause.
+    if [ -n "$PREP_ERRTXT" ]; then
+      warn "Azure reported the following while running the in-guest prep:"
+      printf '%s\n' "$PREP_ERRTXT" | sed 's/^/        /'
+    fi
+    break
   done
-  wait "$PREP_PID" 2>/dev/null
-  PREP=$(cat "$PREP_FILE" 2>/dev/null)
-  # Surface the az error instead of swallowing it - a silent empty result used to hide the cause.
-  if [ -s "$PREP_ERR" ]; then
-    warn "Azure reported the following while running the in-guest prep:"
-    sed 's/^/        /' "$PREP_ERR"
-  fi
-  rm -f "$PREP_FILE" "$PREP_ERR" 2>/dev/null
   step "In-guest prep call returned after $(( (SECONDS-PREP_T0)/60 ))m $(( (SECONDS-PREP_T0)%60 ))s."
 fi
 [ "$DRYRUN" != 1 ] && printf '%s\n' "$PREP" | sed 's/^/        /'
