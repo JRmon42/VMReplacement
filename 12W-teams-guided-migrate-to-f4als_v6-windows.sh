@@ -127,7 +127,14 @@ on_interrupt(){
   printf '   * Do NOT reboot, stop, resize or delete the VM now.\n'
   printf '   * Wait a few minutes, then simply re-run this script - it is safe to re-run and will\n'
   printf '     wait for the in-guest script to finish, then skip whatever is already done.\n'
-  printf '   * Nothing destructive has been performed by this script.\n\n'
+  printf '   * Nothing destructive has been performed by this script.\n'
+  printf '   * TIP: in Cloud Shell, Ctrl-C SENDS AN INTERRUPT - it does not copy. To copy text,\n'
+  printf '     select it and use Ctrl-Insert, or right-click -> Copy.\n'
+  printf '   * The in-guest output is also written to C:\\Windows\\Temp\\mig-prep-last.log inside the\n'
+  printf '     VM, so nothing is lost. Once the guest run has finished you can read it with:\n'
+  printf '       az vm run-command invoke -g %s -n %s --command-id RunPowerShellScript \\\n' "${RG:-<rg>}" "${VM:-<vm>}"
+  printf '         --scripts "Get-Content C:\\Windows\\Temp\\mig-prep-last.log -Tail 60" \\\n'
+  printf '         --query "value[0].message" -o tsv\n\n'
   exit 130
 }
 trap on_interrupt INT
@@ -287,6 +294,11 @@ step "Running in-guest prep (expect 5-60 min; progress is printed below)..."
 # shellcheck disable=SC2016  # the PowerShell must run inside the guest, not expand locally
 GUEST_PREP_PS='
   $ErrorActionPreference = "Continue"
+  # Mirror everything to a file inside the VM. If the operator side is interrupted (Ctrl-C in
+  # Cloud Shell, session timeout, network drop) the run-command result is lost, but the guest
+  # script keeps running - this log lets us recover its outcome afterwards instead of blindly
+  # repeating a 30-60 minute defrag.
+  try { Start-Transcript -Path ($env:SystemRoot + "\Temp\mig-prep-last.log") -Force | Out-Null } catch { }
   Write-Output "PREP_BEGIN"
   try { Write-Output ("OS=" + (Get-CimInstance Win32_OperatingSystem).Caption) } catch { Write-Output "OS=UNKNOWN" }
   # 0) Identify the OS disk and its REAL partition style first - the pagefile decision below
@@ -484,6 +496,7 @@ GUEST_PREP_PS='
       Write-Output "STORNVME=OK"
     } else { Write-Output "STORNVME=MISSING" }
   } catch { Write-Output ("STORNVME=ERROR:" + $_.Exception.Message) }
+  try { Stop-Transcript | Out-Null } catch { }
 '
 
 # The in-guest prep may need exactly ONE restart: pagefile.sys and hiberfil.sys are only released
