@@ -72,6 +72,10 @@
 #              REUSE_SNAPSHOT=0  force a brand-new snapshot instead of reusing the newest existing one
 #              ZONE         (availability zone for the rebuilt VM, e.g. 3; auto-detected)
 #              AUTO=1       run without pausing between phases (no prompts)
+#              SKIP_PREP=1  skip STEP 3 (the in-guest prep). Use ONLY when the OS disk has already
+#                           been converted to GPT offline (from WinRE). Such a VM is GPT on BIOS
+#                           firmware and CANNOT boot until Azure has flipped it to Gen2, so the
+#                           script also leaves it stopped instead of trying to start it.
 #              PREP_TIMEOUT seconds to allow for the in-guest prep (default 4800 = 80 min).
 #                           STEP 3 runs mbr2gpt (and a defrag if needed) inside Windows and can
 #                           legitimately take 20-60 min on a busy production disk - it is NOT hung.
@@ -91,6 +95,7 @@ SNAPSHOT="${SNAPSHOT:-}"
 SNAPSHOT_SKU="${SNAPSHOT_SKU:-}"   # storage SKU for the safety snapshot; auto-matched to existing ones
 ZONE="${ZONE:-}"
 AUTO="${AUTO:-0}"
+SKIP_PREP="${SKIP_PREP:-0}"        # OS disk already converted to GPT offline (WinRE): skip STEP 3
 DRYRUN="${DRYRUN:-0}"
 BOOT_TRIES="${BOOT_TRIES:-40}"     # boot-health polls (x ~15s => ~10 min)
 PREP_TIMEOUT="${PREP_TIMEOUT:-4800}" # max seconds to wait for the in-guest prep (80 min; Azure caps run-command at 90)
@@ -223,7 +228,11 @@ ok "Running as: $(az account show --query user.name -o tsv 2>/dev/null)  (needs 
 case "${POWER:-}" in
   *running*) ok "VM is running (in-guest prep can run).";;
   *)
-    if [ "$DRYRUN" = 1 ]; then
+    if [ "$SKIP_PREP" = 1 ]; then
+      # A disk converted offline is GPT while the VM is still Gen1/BIOS: it physically cannot
+      # boot until the Gen2 flip below. Starting it here would only produce a boot failure.
+      ok "VM is '${POWER:-unknown}' - leaving it stopped (SKIP_PREP=1; it cannot boot until the Gen2 flip)."
+    elif [ "$DRYRUN" = 1 ]; then
       warn "VM is '${POWER:-unknown}'. In a real run it is started here and we wait for the guest agent before the in-guest prep."
     else
       step "VM is '${POWER:-unknown}' - starting it so the in-guest prep can run..."
@@ -279,6 +288,17 @@ else
 fi
 warn "ROLLBACK POINT: keep this snapshot name -> $SNAPSHOT"
 mark "Safety snapshot ready ($SNAPSHOT)"; recap
+if [ "$SKIP_PREP" = 1 ]; then
+  # Offline (WinRE) conversion path: mbr2gpt has already run against the stopped disk, so there is
+  # nothing to do inside Windows - and nothing COULD run there, because a GPT disk on a Gen1/BIOS
+  # VM does not boot. Go straight to the Gen2 flip, which is what makes it bootable again.
+  phase "Guest prep SKIPPED (SKIP_PREP=1) - OS disk already converted offline"
+  warn "You have told the script the OS disk is ALREADY GPT/UEFI (converted from WinRE)."
+  warn "STEP 3 is therefore skipped: the VM is Gen1/BIOS with a GPT disk, so it cannot boot"
+  warn "until the Gen2 conversion below has been applied. This is expected - do not start it."
+  warn "NOTE: the StorNVMe boot-start setting normally applied in STEP 3 must already be in place."
+  confirm "Confirm the OS disk is GPT with an EFI System Partition, and proceed to the Gen2 conversion?"
+else
 confirm "Snapshot done. Proceed to prepare the Windows guest?"
 
 # ============================== STEP: GUEST PREP ===========================
@@ -634,6 +654,7 @@ if [ "$DRYRUN" != 1 ]; then
 fi
 break
 done
+fi
 mark "Guest prepared (pagefile-on-C, GPT/EFI, NVMe-ready)"; recap
 confirm "Guest prep looks good. Proceed to convert the VM to Gen2 (Trusted Launch)?"
 
