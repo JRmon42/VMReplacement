@@ -279,9 +279,9 @@ phase "Prepare the Windows guest (pagefile off D:, MBR->GPT, NVMe driver), then 
 warn "This step runs INSIDE Windows and is the SLOWEST part of the migration."
 warn "mbr2gpt (and a defrag, if one is needed) can take 20-60 minutes on a busy production C:."
 warn "A progress line is printed every 20s. DO NOT press Ctrl-C and DO NOT close this window."
-warn "If the OS disk is still MBR, the pagefile is removed for the duration of the conversion so"
-warn "that C: can be shrunk. If Windows still cannot free space, the script offers to GROW the OS"
-warn "disk by a few hundred MB from Azure (metadata-only, no data touched) and continues by itself."
+warn "If the OS disk is still MBR, the pagefile is removed and the script TESTS whether C: can be"
+warn "shrunk (mbr2gpt always carves the EFI partition out of C:, and ignores free space elsewhere)."
+warn "You may be asked for ONE Windows restart, after which it continues on its own."
 warn "A system-managed pagefile on C: is restored automatically once the disk is GPT."
 step "Running in-guest prep (expect 5-60 min; progress is printed below)..."
 # shellcheck disable=SC2016  # the PowerShell must run inside the guest, not expand locally
@@ -346,48 +346,57 @@ GUEST_PREP_PS='
         }
 
         # mbr2gpt must carve an ~100MB EFI System Partition out of the disk. In full-OS mode it
-        # cannot reuse the existing "System Reserved" partition, so it tries to shrink C: itself -
-        # and that shrink returns 0 bytes when immovable files sit at the end of the volume
-        # ("Partition final size is <n> (initial size was <n>), cannot rely on this space").
-        # Free space INSIDE C: does not help; the space must be UNALLOCATED. So create it here,
-        # after removing the three things that make an online shrink impossible: the pagefile
-        # (already removed above), the hibernation file, and Volume Shadow Copies.
-        $needSpace = $false
+        # cannot reuse the existing "System Reserved" partition, so it ALWAYS tries to shrink C:
+        # itself - and it ignores any unallocated space that already exists on the disk (proven on
+        # azumw17011: 1023MB free after C: and it still failed with "Cannot find room for the EFI
+        # system partition"). So the ONLY thing that matters is: can Windows shrink C: right now?
+        # A shrink stops at the last IMMOVABLE file, hence the cleanup below, and we then TEST the
+        # shrink ourselves so we know the answer before mbr2gpt spends 30 minutes finding out.
+        $needReboot = $false
+        $blocked = $false
         try {
           $dsk = Get-Disk -Number $osNum
-          $unalloc = $dsk.Size - $dsk.AllocatedSize
-          Write-Output ("UNALLOC_MB=" + [math]::Round($unalloc/1MB,0))
-          if ($unalloc -lt 300MB) {
-            try { & "$env:SystemRoot\System32\powercfg.exe" -h off 2>&1 | Out-Null; Write-Output "HIBER=off" } catch { Write-Output ("HIBER=ERROR:" + $_.Exception.Message) }
-            try { & "$env:SystemRoot\System32\vssadmin.exe" delete shadows /all /quiet 2>&1 | Out-Null; Write-Output "SHADOWS=deleted" } catch { Write-Output ("SHADOWS=ERROR:" + $_.Exception.Message) }
-            $pf = @(Get-ChildItem -Force -Path "C:\" -Filter "pagefile.sys" -ErrorAction SilentlyContinue).Count
-            $hf = @(Get-ChildItem -Force -Path "C:\" -Filter "hiberfil.sys" -ErrorAction SilentlyContinue).Count
-            Write-Output ("IMMOVABLE=pagefile:" + $pf + " hiberfil:" + $hf)
-            # diskpart is markedly more reliable than Resize-Partition for an ONLINE NTFS shrink
-            # (Resize-Partition validates against Get-PartitionSupportedSize, which reports the
-            # theoretical minimum and happily rejects a valid request with "Size Not Supported").
-            # diskpart also tells us exactly how many MB it managed to free.
-            $dpf = Join-Path $env:TEMP "mig-shrink-c.txt"
-            Set-Content -Path $dpf -Value @("select volume C","shrink desired=1024 minimum=260","exit") -Encoding Ascii
-            $dpo = & "$env:SystemRoot\System32\diskpart.exe" /s $dpf 2>&1
-            Remove-Item $dpf -Force -ErrorAction SilentlyContinue
-            Write-Output ("DISKPART=" + (($dpo | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
-            $dsk = Get-Disk -Number $osNum
-            $unalloc = $dsk.Size - $dsk.AllocatedSize
-            Write-Output ("UNALLOC_MB_AFTER=" + [math]::Round($unalloc/1MB,0))
-            if ($unalloc -lt 260MB) {
-              # Nothing could be freed from inside Windows (immovable files, and pagefile.sys /
-              # hiberfil.sys are only really released at the next boot). The reliable fix is to
-              # ADD space from the Azure side by growing the managed disk: that is a metadata-only
-              # operation which never touches the file system, and the new space lands right after
-              # C: - exactly where mbr2gpt wants to create the EFI partition.
-              Write-Output "SHRINK=NEED_SPACE"
-              $needSpace = $true
-            } else { Write-Output "SHRINK=OK" }
-          } else { Write-Output "SHRINK=NOT_NEEDED" }
+          Write-Output ("UNALLOC_MB=" + [math]::Round(($dsk.Size - $dsk.AllocatedSize)/1MB,0))
+          try { & "$env:SystemRoot\System32\powercfg.exe" -h off 2>&1 | Out-Null; Write-Output "HIBER=off" } catch { Write-Output ("HIBER=ERROR:" + $_.Exception.Message) }
+          try { & "$env:SystemRoot\System32\vssadmin.exe" delete shadows /all /quiet 2>&1 | Out-Null; Write-Output "SHADOWS=deleted" } catch { Write-Output ("SHADOWS=ERROR:" + $_.Exception.Message) }
+          $pf = @(Get-ChildItem -Force -Path "C:\" -Filter "pagefile.sys" -ErrorAction SilentlyContinue).Count
+          $hf = @(Get-ChildItem -Force -Path "C:\" -Filter "hiberfil.sys" -ErrorAction SilentlyContinue).Count
+          Write-Output ("IMMOVABLE=pagefile:" + $pf + " hiberfil:" + $hf)
+          $cBefore = (Get-Partition -DriveLetter C).Size
+          # diskpart is markedly more reliable than Resize-Partition for an ONLINE NTFS shrink
+          # (Resize-Partition validates against Get-PartitionSupportedSize, which reports the
+          # theoretical minimum and happily rejects a valid request with "Size Not Supported").
+          $dpf = Join-Path $env:TEMP "mig-shrink-c.txt"
+          Set-Content -Path $dpf -Value @("select volume C","shrink desired=512 minimum=300","exit") -Encoding Ascii
+          $dpo = & "$env:SystemRoot\System32\diskpart.exe" /s $dpf 2>&1
+          Remove-Item $dpf -Force -ErrorAction SilentlyContinue
+          Write-Output ("DISKPART=" + (($dpo | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
+          $cAfter = (Get-Partition -DriveLetter C).Size
+          $freed = $cBefore - $cAfter
+          Write-Output ("SHRINK_FREED_MB=" + [math]::Round($freed/1MB,0))
+          $dsk = Get-Disk -Number $osNum
+          Write-Output ("UNALLOC_MB_AFTER=" + [math]::Round(($dsk.Size - $dsk.AllocatedSize)/1MB,0))
+          # When a shrink is cut short, Windows logs event 259 naming the exact file that blocked
+          # it. That single line tells us what to remove instead of guessing.
+          try {
+            $ev = Get-WinEvent -FilterHashtable @{LogName="Application"; Id=259} -MaxEvents 1 -ErrorAction SilentlyContinue
+            if ($ev) { Write-Output ("LAST_UNMOVABLE=" + (($ev.Message | Out-String).Trim() -replace "\s*\r?\n\s*"," | ")) }
+          } catch {}
+          if ($freed -lt 100MB) {
+            if ($pf -gt 0 -or $hf -gt 0) {
+              # pagefile.sys / hiberfil.sys are still open; they are only released at the next
+              # boot. One restart and a retry is all that is needed.
+              Write-Output "SHRINK=NEED_REBOOT"
+              $needReboot = $true
+            } else {
+              Write-Output "SHRINK=BLOCKED"
+              $blocked = $true
+            }
+          } else { Write-Output "SHRINK=OK" }
         } catch { Write-Output ("SHRINK=ERROR:" + $_.Exception.Message) }
 
-        if ($needSpace) { Write-Output "MBR2GPT=NEED_SPACE" }
+        if ($needReboot) { Write-Output "MBR2GPT=NEED_REBOOT" }
+        elseif ($blocked) { Write-Output "MBR2GPT=SHRINK_BLOCKED" }
         else {
         # Run /validate FIRST. A defrag is only needed when validate complains, and a defrag of a
         # production C: can take 20-60 minutes - so we no longer pay that cost unconditionally.
@@ -507,51 +516,23 @@ if [ "$DRYRUN" != 1 ]; then
     fi
     die "The in-guest preparation did not finish (see the partial output above)." "The guest script stopped before completing all steps. Copy the full output above and send it to us so we can pinpoint the failing step, then re-run."
   fi
-  # Windows could not free any unallocated space on the OS disk. Add it from the Azure side
-  # instead: growing the managed disk is a metadata-only operation (no file system is touched,
-  # no data is moved) and the new space appears right after C:, exactly where mbr2gpt wants to
-  # create the EFI System Partition. The VM must be deallocated for an OS-disk resize.
-  if grep -q "MBR2GPT=NEED_SPACE" <<<"$PREP"; then
+  # C: could not be shrunk yet because pagefile.sys / hiberfil.sys are still open. They have
+  # just been de-configured, and Windows only releases them at the next boot - so restart once
+  # and run the prep again. NOTE: growing the disk does NOT help here; mbr2gpt in full-OS mode
+  # ignores existing unallocated space and insists on shrinking C: itself.
+  if grep -q "MBR2GPT=NEED_REBOOT" <<<"$PREP"; then
     if [ "$PREP_ATTEMPT" -ge 2 ]; then
-      die "Even after growing the OS disk, mbr2gpt still reports no room for the EFI partition." "Send us the UNALLOC_MB / UNALLOC_MB_AFTER / DISKPART / PART lines above. NOTHING destructive has run - the VM still boots and snapshot '$SNAPSHOT' remains your rollback point."
+      die "Even after a restart, Windows still cannot shrink C:." "Send us the SHRINK_FREED_MB / DISKPART / LAST_UNMOVABLE lines above - LAST_UNMOVABLE names the exact file that blocks the shrink. NOTHING destructive has run - the VM still boots and snapshot '$SNAPSHOT' remains your rollback point."
     fi
-    CUR_GB=$(az disk show -g "$RG" -n "$OSDISK" --query diskSizeGb -o tsv 2>/dev/null || echo "")
-    [ -n "$CUR_GB" ] || die "Could not read the current size of OS disk '$OSDISK'." "Check your permissions on the disk, then re-run."
-    # Stay inside the current billing tier when possible: Premium/Standard SSD are billed per
-    # tier (.. 64, 128, 256 ..GiB), so growing 127 -> 128 GiB costs nothing extra.
-    NEW_GB=""
-    for t in 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32767; do
-      if [ "$t" -gt "$CUR_GB" ]; then NEW_GB="$t"; break; fi
-    done
-    SAME_TIER=1
-    if [ -z "$NEW_GB" ] || [ "$((NEW_GB - CUR_GB))" -gt 8 ]; then NEW_GB=$((CUR_GB + 1)); SAME_TIER=0; fi
-    warn "Windows cannot free any unallocated space on the OS disk (immovable files at the end of C:)."
-    warn "The safe fix is to GROW the OS disk from Azure: ${CUR_GB} GiB -> ${NEW_GB} GiB."
-    warn "This is a metadata-only change: no file system is touched and no data is moved or resized."
-    if [ "$SAME_TIER" = 1 ]; then
-      warn "${NEW_GB} GiB is the top of the CURRENT billing tier, so there is NO additional cost."
-    else
-      warn "NOTE: the disk is already at a tier boundary, so +1 GiB moves it to the next billing"
-      warn "tier. Confirm with the disk owner if cost matters, or answer 'n' and contact us."
-    fi
-    warn "An OS-disk resize requires the VM to be deallocated: the VM will be stopped and restarted."
-    confirm "Grow the OS disk to ${NEW_GB} GiB (stop + resize + start), then continue automatically?"
-    step "Deallocating the VM (required to resize an OS disk)..."
-    run az vm deallocate -g "$RG" -n "$VM" -o none
-    step "Growing '$OSDISK' from ${CUR_GB} GiB to ${NEW_GB} GiB..."
-    run az disk update -g "$RG" -n "$OSDISK" --size-gb "$NEW_GB" -o none
-    CHK_GB=$(az disk show -g "$RG" -n "$OSDISK" --query diskSizeGb -o tsv 2>/dev/null || echo "")
-    if [ "$CHK_GB" != "$NEW_GB" ]; then
-      bad "The OS disk is still ${CHK_GB:-unknown} GiB - the resize did not apply."
-      step "Starting the VM again so it is left running..."
-      run az vm start -g "$RG" -n "$VM" -o none
-      die "Could not grow the OS disk." "Grow '$OSDISK' to ${NEW_GB} GiB manually (portal: Disk > Size + performance) while the VM is deallocated, then re-run this script. Snapshot '$SNAPSHOT' remains your rollback point."
-    fi
-    ok "OS disk is now ${NEW_GB} GiB - ~$(( (NEW_GB - CUR_GB) * 1024 ))MB of unallocated space is available for the EFI partition."
-    step "Starting the VM..."
-    run az vm start -g "$RG" -n "$VM" -o none
+    warn "Windows cannot shrink C: yet: pagefile.sys and/or hiberfil.sys are still open."
+    warn "They have just been DISABLED, and only a restart actually releases them."
+    warn "This is a normal, reversible Windows reboot - no data is touched. A system-managed"
+    warn "pagefile on C: is restored automatically once the disk is GPT."
+    confirm "Restart Windows now to release those files, then continue automatically?"
+    step "Restarting the VM..."
+    run az vm restart -g "$RG" -n "$VM" -o none
     if ! wait_boot 40; then
-      die "The VM did not report back after the resize." "Check it in the portal; once it is running and the guest agent is 'Ready', simply re-run this script - it is safe to re-run and resumes where it stopped. Snapshot '$SNAPSHOT' remains your rollback point."
+      die "The VM did not report back after the restart." "Check it in the portal; once it is running and the guest agent is 'Ready', simply re-run this script - it is safe to re-run and resumes where it stopped. Snapshot '$SNAPSHOT' remains your rollback point."
     fi
     ok "VM restarted and responding - re-running the guest prep (attempt 2/2)."
     continue
@@ -559,8 +540,9 @@ if [ "$DRYRUN" != 1 ]; then
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
+    *SHRINK_BLOCKED*) die "Windows cannot shrink C: at all, so mbr2gpt has nowhere to create the EFI partition." "The pagefile and hibernation file are gone and shadow copies were deleted, yet the shrink still freed nothing. The 'LAST_UNMOVABLE=' line above names the exact file that blocks it (typically a backup/AV/dedup agent file, or a VSS diff area). Remove or relocate that file, or stop the agent that owns it, then re-run. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *VALIDATE_FAIL*)  die "mbr2gpt /validate failed (details captured above: MBR2GPT_OUT / SETUPACT / DISK0 / PART lines)." "Send us those lines - they name the exact reason. Most common: >3 primary partitions, or no room for the ~100MB EFI system partition. Do NOT proceed; we'll advise the targeted fix.";;
-    *CONVERT_FAIL*)   die "mbr2gpt /convert failed (diagnostics captured above)." "mbr2gpt validated the disk but could not create the ~100MB EFI partition. Look at the SETUPACT lines: 'Partition final size is <n> (initial size was <n>), cannot rely on this space' means it could not shrink C: because immovable files sit at the end of the volume. Free space INSIDE C: does not help - the space must be UNALLOCATED. Send us the UNALLOC_MB / DISKPART / IMMOVABLE lines above. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
+    *CONVERT_FAIL*)   die "mbr2gpt /convert failed (diagnostics captured above)." "mbr2gpt validated the disk but could not create the ~100MB EFI partition. In full-OS mode it ALWAYS carves the ESP by shrinking C: - it ignores unallocated space that already exists on the disk, so growing the disk does not help. 'Partition final size is <n> (initial size was <n>)' means the shrink freed nothing because an immovable file sits at the end of C:. Send us the SHRINK_FREED_MB / DISKPART / LAST_UNMOVABLE lines above. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
     *GPT_NO_ESP*)     die "The OS disk is GPT but has no EFI System Partition." "Unusual layout - send us the OSDISK/PART lines above so we can add the ESP before the Gen2 flip.";;
     *STORNVME=MISSING*) die "StorNVMe driver missing (very old image)." "Update the guest to WS2019+, then re-run.";;
