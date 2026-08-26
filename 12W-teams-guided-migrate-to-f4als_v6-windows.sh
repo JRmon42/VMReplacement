@@ -364,7 +364,7 @@ GUEST_PREP_PS='
           # Delete the ones that are no longer open (never touch the current one: the agent is
           # what is executing this very script).
           try {
-            $old = @(Get-ChildItem "C:\WindowsAzure\Logs" -Recurse -Force -Include *.etl -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) })
+            $old = @(Get-ChildItem -Path "C:\WindowsAzure\Logs" -Recurse -Force -Filter "*.etl" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) })
             $n = 0
             foreach ($f in $old) { try { Remove-Item $f.FullName -Force -ErrorAction Stop; $n++ } catch {} }
             Write-Output ("AGENTLOGS=deleted:" + $n + " of:" + $old.Count)
@@ -372,17 +372,33 @@ GUEST_PREP_PS='
           $pf = @(Get-ChildItem -Force -Path "C:\" -Filter "pagefile.sys" -ErrorAction SilentlyContinue).Count
           $hf = @(Get-ChildItem -Force -Path "C:\" -Filter "hiberfil.sys" -ErrorAction SilentlyContinue).Count
           Write-Output ("IMMOVABLE=pagefile:" + $pf + " hiberfil:" + $hf)
-          $cBefore = (Get-Partition -DriveLetter C).Size
-          # diskpart is markedly more reliable than Resize-Partition for an ONLINE NTFS shrink
-          # (Resize-Partition validates against Get-PartitionSupportedSize, which reports the
-          # theoretical minimum and happily rejects a valid request with "Size Not Supported").
+          $cpart = Get-Partition -DriveLetter C
+          $sup = Get-PartitionSupportedSize -DiskNumber $osNum -PartitionNumber $cpart.PartitionNumber -ErrorAction SilentlyContinue
+          if ($sup) { Write-Output ("CPART=disk:" + $osNum + " part:" + $cpart.PartitionNumber + " sizeMB:" + [math]::Round($cpart.Size/1MB,0) + " minMB:" + [math]::Round($sup.SizeMin/1MB,0) + " reclaimableMB:" + [math]::Round(($cpart.Size - $sup.SizeMin)/1MB,0)) }
+          $cBefore = $cpart.Size
+          # Select the volume by DISK + PARTITION number, never by drive letter: on azumw17011
+          # "select volume C" reported "Volume 1 is the selected volume" and then refused a 512MB
+          # shrink as "smaller than the minimum volume size" - it had picked the 500MB System
+          # Reserved volume, not C:. list volume is included so the mapping is visible in the log.
           $dpf = Join-Path $env:TEMP "mig-shrink-c.txt"
-          Set-Content -Path $dpf -Value @("select volume C","shrink desired=512 minimum=300","exit") -Encoding Ascii
+          Set-Content -Path $dpf -Value @("list volume","select disk " + $osNum,"select partition " + $cpart.PartitionNumber,"shrink desired=512 minimum=128","exit") -Encoding Ascii
           $dpo = & "$env:SystemRoot\System32\diskpart.exe" /s $dpf 2>&1
           Remove-Item $dpf -Force -ErrorAction SilentlyContinue
           Write-Output ("DISKPART=" + (($dpo | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
           $cAfter = (Get-Partition -DriveLetter C).Size
           $freed = $cBefore - $cAfter
+          if ($freed -lt 100MB -and $sup) {
+            # Fall back to the storage cmdlet with an explicit absolute target size, clamped to
+            # the minimum the file system itself reports.
+            $target = $cBefore - 512MB
+            if ($target -lt $sup.SizeMin) { $target = $sup.SizeMin }
+            if ($target -lt $cBefore) {
+              try { Resize-Partition -DiskNumber $osNum -PartitionNumber $cpart.PartitionNumber -Size $target -ErrorAction Stop; Write-Output "RESIZE=OK" }
+              catch { Write-Output ("RESIZE=FAIL:" + $_.Exception.Message) }
+              $cAfter = (Get-Partition -DriveLetter C).Size
+              $freed = $cBefore - $cAfter
+            }
+          }
           Write-Output ("SHRINK_FREED_MB=" + [math]::Round($freed/1MB,0))
           $dsk = Get-Disk -Number $osNum
           Write-Output ("UNALLOC_MB_AFTER=" + [math]::Round(($dsk.Size - $dsk.AllocatedSize)/1MB,0))
@@ -557,7 +573,7 @@ if [ "$DRYRUN" != 1 ]; then
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
-    *SHRINK_BLOCKED*) die "Windows cannot shrink C: at all, so mbr2gpt has nowhere to create the EFI partition." "The pagefile and hibernation file are gone and shadow copies were deleted, yet the shrink still freed nothing. The 'LAST_UNMOVABLE=' line above names the exact file that blocks it (typically a backup/AV/dedup agent file, or a VSS diff area). Remove or relocate that file, or stop the agent that owns it, then re-run. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
+    *SHRINK_BLOCKED*) die "Windows cannot shrink C: at all, so mbr2gpt has nowhere to create the EFI partition." "The pagefile and hibernation file are gone and shadow copies were deleted, yet the shrink still freed nothing. Compare the 'CPART=' line (how much the file system says is reclaimable) with the 'DISKPART=' and 'RESIZE=' lines (what actually happened), and 'LAST_UNMOVABLE=' which names the file that caps the shrink. Send us those four lines. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *VALIDATE_FAIL*)  die "mbr2gpt /validate failed (details captured above: MBR2GPT_OUT / SETUPACT / DISK0 / PART lines)." "Send us those lines - they name the exact reason. Most common: >3 primary partitions, or no room for the ~100MB EFI system partition. Do NOT proceed; we'll advise the targeted fix.";;
     *CONVERT_FAIL*)   die "mbr2gpt /convert failed (diagnostics captured above)." "mbr2gpt validated the disk but could not create the ~100MB EFI partition. In full-OS mode it ALWAYS carves the ESP by shrinking C: - it ignores unallocated space that already exists on the disk, so growing the disk does not help. 'Partition final size is <n> (initial size was <n>)' means the shrink freed nothing because an immovable file sits at the end of C:. Send us the SHRINK_FREED_MB / DISKPART / LAST_UNMOVABLE lines above. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
