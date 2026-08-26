@@ -381,9 +381,13 @@ GUEST_PREP_PS='
           # shrink as "smaller than the minimum volume size" - it had picked the 500MB System
           # Reserved volume, not C:. list volume is included so the mapping is visible in the log.
           $dpf = Join-Path $env:TEMP "mig-shrink-c.txt"
-          Set-Content -Path $dpf -Value @("list volume","select disk " + $osNum,"select partition " + $cpart.PartitionNumber,"shrink desired=512 minimum=128","exit") -Encoding Ascii
+          # Select by drive letter. An earlier build used "select disk N" + "select partition M",
+          # but diskpart rejected it ("The arguments specified for this command are not valid"),
+          # so the shrink never ran. "select volume C" is proven correct on this VM: the
+          # "list volume" output shows Volume 1 = C: (Windows, Boot).
+          $dpcmds = @("list volume","select volume C","shrink desired=512 minimum=128","exit")
+          Set-Content -Path $dpf -Value $dpcmds -Encoding Ascii
           $dpo = & "$env:SystemRoot\System32\diskpart.exe" /s $dpf 2>&1
-          Remove-Item $dpf -Force -ErrorAction SilentlyContinue
           Write-Output ("DISKPART=" + (($dpo | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
           $cAfter = (Get-Partition -DriveLetter C).Size
           $freed = $cBefore - $cAfter
@@ -394,11 +398,25 @@ GUEST_PREP_PS='
             if ($target -lt $sup.SizeMin) { $target = $sup.SizeMin }
             if ($target -lt $cBefore) {
               try { Resize-Partition -DiskNumber $osNum -PartitionNumber $cpart.PartitionNumber -Size $target -ErrorAction Stop; Write-Output "RESIZE=OK" }
-              catch { Write-Output ("RESIZE=FAIL:" + $_.Exception.Message) }
+              catch { Write-Output ("RESIZE=FAIL:" + (($_.Exception.Message | Out-String).Trim() -replace "\s*\r?\n\s*"," | ")) }
               $cAfter = (Get-Partition -DriveLetter C).Size
               $freed = $cBefore - $cAfter
             }
           }
+          if ($freed -lt 100MB) {
+            # Last resort before giving up: consolidate free space (defrag /X is specifically the
+            # remedy for "the shrink freed nothing"), then repeat the diskpart shrink once.
+            try {
+              & "$env:SystemRoot\System32\defrag.exe" C: /X /U 2>&1 | Out-Null
+              Write-Output "DEFRAGX=done"
+            } catch { Write-Output ("DEFRAGX=ERROR:" + $_.Exception.Message) }
+            Set-Content -Path $dpf -Value $dpcmds -Encoding Ascii
+            $dpo2 = & "$env:SystemRoot\System32\diskpart.exe" /s $dpf 2>&1
+            Write-Output ("DISKPART2=" + (($dpo2 | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
+            $cAfter = (Get-Partition -DriveLetter C).Size
+            $freed = $cBefore - $cAfter
+          }
+          Remove-Item $dpf -Force -ErrorAction SilentlyContinue
           Write-Output ("SHRINK_FREED_MB=" + [math]::Round($freed/1MB,0))
           $dsk = Get-Disk -Number $osNum
           Write-Output ("UNALLOC_MB_AFTER=" + [math]::Round(($dsk.Size - $dsk.AllocatedSize)/1MB,0))
@@ -563,17 +581,35 @@ if [ "$DRYRUN" != 1 ]; then
     ok "VM restarted and responding - re-running the guest prep (attempt 2/2)."
     continue
   fi
+  # The shrink was refused although the file system itself reports tens of GB as reclaimable
+  # (see the CPART= line). Every removal we did - pagefile, hibernation file, shadow copies,
+  # guest-agent traces - only takes effect for the shrink logic after a reboot: until then NTFS
+  # still accounts for the old extents and the volume bitmap is not re-evaluated. So restart once
+  # and retry before declaring this blocked.
+  if grep -q "SHRINK=BLOCKED" <<<"$PREP" && [ "$PREP_ATTEMPT" -lt 2 ]; then
+    warn "Windows refused to shrink C:, even though it reports tens of GB as reclaimable."
+    warn "The pagefile, hibernation file, shadow copies and stale guest-agent logs have just been"
+    warn "removed, but NTFS only re-evaluates the volume after a restart. Retrying once after a reboot."
+    confirm "Restart Windows now and retry the shrink automatically?"
+    step "Restarting the VM..."
+    run az vm restart -g "$RG" -n "$VM" -o none
+    if ! wait_boot 40; then
+      die "The VM did not report back after the restart." "Check it in the portal; once it is running and the guest agent is 'Ready', simply re-run this script - it is safe to re-run and resumes where it stopped. Snapshot '$SNAPSHOT' remains your rollback point."
+    fi
+    ok "VM restarted and responding - re-running the guest prep (attempt 2/2)."
+    continue
+  fi
   # Shrink worked but mbr2gpt still refused: we have then hit the hard limitation of full-OS mode
   # (it will not reuse the System Reserved partition, and it does not use free space it did not
   # create itself). That cannot be solved from inside the running OS - say so explicitly instead
   # of sending the operator round the same loop again.
   if grep -q "CONVERT_FAIL" <<<"$PREP" && grep -q "SHRINK=OK" <<<"$PREP"; then
-    die "C: was shrunk successfully, but mbr2gpt still cannot create the EFI partition." "This is the known dead end of running mbr2gpt inside a live Windows (/allowFullOS): it refuses to reuse the existing 500MB 'System Reserved' partition and will not use free space it did not create itself. The conversion has to be done with the disk OFFLINE - either from WinRE on this VM, or by attaching this OS disk as a DATA disk to a helper VM and running 'mbr2gpt /convert /disk:<n> /allowFullOS' there, where no file is locked. Contact us and we will drive that procedure with you. NOTHING destructive has run - the VM still boots and snapshot '$SNAPSHOT' remains your rollback point."
+    die "C: was shrunk successfully, but mbr2gpt still cannot create the EFI partition." "This is the known dead end of running mbr2gpt inside a live Windows (/allowFullOS): it logs 'System partition cannot be removed in full OS mode, leaving it untouched', so it refuses to reuse the existing 500MB 'System Reserved' partition, and it will not use free space it did not create itself. The conversion has to be done with the disk OFFLINE, from WinRE on this VM (reagentc /boottore + restart, then 'mbr2gpt /convert /disk:0'), where that restriction does not apply and the System Reserved partition itself becomes the EFI partition. Note that attaching the OS disk to a helper VM does NOT work: mbr2gpt only accepts the system disk. Contact us and we will drive the WinRE procedure with you. NOTHING destructive has run - the VM still boots and snapshot '$SNAPSHOT' remains your rollback point."
   fi
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
-    *SHRINK_BLOCKED*) die "Windows cannot shrink C: at all, so mbr2gpt has nowhere to create the EFI partition." "The pagefile and hibernation file are gone and shadow copies were deleted, yet the shrink still freed nothing. Compare the 'CPART=' line (how much the file system says is reclaimable) with the 'DISKPART=' and 'RESIZE=' lines (what actually happened), and 'LAST_UNMOVABLE=' which names the file that caps the shrink. Send us those four lines. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
+    *SHRINK_BLOCKED*) die "Windows cannot shrink C: at all, even after a restart and a free-space consolidation." "Every prerequisite has been cleared (pagefile, hibernation file, shadow copies, stale guest-agent traces) and the file system itself reports tens of GB as reclaimable on the CPART= line, yet diskpart, Resize-Partition and mbr2gpt all refuse the shrink. We have exhausted what can be done from inside the running OS. The remaining route is the OFFLINE conversion from WinRE on this VM, where mbr2gpt turns the existing 500MB 'System Reserved' partition into the EFI partition and no shrink of C: is needed at all. Send us the CPART / DISKPART / DISKPART2 / RESIZE / LAST_UNMOVABLE lines above and we will schedule that with you. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *VALIDATE_FAIL*)  die "mbr2gpt /validate failed (details captured above: MBR2GPT_OUT / SETUPACT / DISK0 / PART lines)." "Send us those lines - they name the exact reason. Most common: >3 primary partitions, or no room for the ~100MB EFI system partition. Do NOT proceed; we'll advise the targeted fix.";;
     *CONVERT_FAIL*)   die "mbr2gpt /convert failed (diagnostics captured above)." "mbr2gpt validated the disk but could not create the ~100MB EFI partition. In full-OS mode it ALWAYS carves the ESP by shrinking C: - it ignores unallocated space that already exists on the disk, so growing the disk does not help. 'Partition final size is <n> (initial size was <n>)' means the shrink freed nothing because an immovable file sits at the end of C:. Send us the SHRINK_FREED_MB / DISKPART / LAST_UNMOVABLE lines above. NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
