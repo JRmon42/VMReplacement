@@ -359,6 +359,16 @@ GUEST_PREP_PS='
           Write-Output ("UNALLOC_MB=" + [math]::Round(($dsk.Size - $dsk.AllocatedSize)/1MB,0))
           try { & "$env:SystemRoot\System32\powercfg.exe" -h off 2>&1 | Out-Null; Write-Output "HIBER=off" } catch { Write-Output ("HIBER=ERROR:" + $_.Exception.Message) }
           try { & "$env:SystemRoot\System32\vssadmin.exe" delete shadows /all /quiet 2>&1 | Out-Null; Write-Output "SHADOWS=deleted" } catch { Write-Output ("SHADOWS=ERROR:" + $_.Exception.Message) }
+          # The Azure guest agent writes ETL traces to C:\WindowsAzure\Logs and they are appended
+          # continuously - on azumw17011 event 259 named one of them as the last unmovable file.
+          # Delete the ones that are no longer open (never touch the current one: the agent is
+          # what is executing this very script).
+          try {
+            $old = @(Get-ChildItem "C:\WindowsAzure\Logs" -Recurse -Force -Include *.etl -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) })
+            $n = 0
+            foreach ($f in $old) { try { Remove-Item $f.FullName -Force -ErrorAction Stop; $n++ } catch {} }
+            Write-Output ("AGENTLOGS=deleted:" + $n + " of:" + $old.Count)
+          } catch { Write-Output ("AGENTLOGS=ERROR:" + $_.Exception.Message) }
           $pf = @(Get-ChildItem -Force -Path "C:\" -Filter "pagefile.sys" -ErrorAction SilentlyContinue).Count
           $hf = @(Get-ChildItem -Force -Path "C:\" -Filter "hiberfil.sys" -ErrorAction SilentlyContinue).Count
           Write-Output ("IMMOVABLE=pagefile:" + $pf + " hiberfil:" + $hf)
@@ -536,6 +546,13 @@ if [ "$DRYRUN" != 1 ]; then
     fi
     ok "VM restarted and responding - re-running the guest prep (attempt 2/2)."
     continue
+  fi
+  # Shrink worked but mbr2gpt still refused: we have then hit the hard limitation of full-OS mode
+  # (it will not reuse the System Reserved partition, and it does not use free space it did not
+  # create itself). That cannot be solved from inside the running OS - say so explicitly instead
+  # of sending the operator round the same loop again.
+  if grep -q "CONVERT_FAIL" <<<"$PREP" && grep -q "SHRINK=OK" <<<"$PREP"; then
+    die "C: was shrunk successfully, but mbr2gpt still cannot create the EFI partition." "This is the known dead end of running mbr2gpt inside a live Windows (/allowFullOS): it refuses to reuse the existing 500MB 'System Reserved' partition and will not use free space it did not create itself. The conversion has to be done with the disk OFFLINE - either from WinRE on this VM, or by attaching this OS disk as a DATA disk to a helper VM and running 'mbr2gpt /convert /disk:<n> /allowFullOS' there, where no file is locked. Contact us and we will drive that procedure with you. NOTHING destructive has run - the VM still boots and snapshot '$SNAPSHOT' remains your rollback point."
   fi
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
