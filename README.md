@@ -6,6 +6,15 @@ preserving all configuration stored on the system (OS) disk. Region: West Europe
 > Edit `RG`, the VM names, and (for blue/green) the snapshot names before running.
 > Test in a non-production subscription first.
 
+> **Disclaimer.** These scripts are provided **as-is, with no warranty**, as
+> best-effort assistance to speed up a migration. They are **not a Microsoft
+> product**, not a supported Microsoft deliverable, and are **not covered by any
+> support agreement or SLA**. Review every command, validate in a
+> non-production environment, and satisfy your own change-management and backup
+> requirements before running anything against production. The snapshots and
+> per-step gates are a safety net, not a guarantee — confirm your restore path
+> works *before* you start.
+
 | # | Script | Scope | Method |
 |---|--------|-------|--------|
 | 00 | `00-snapshot-all.sh` | All VMs | Pre-step: incremental rollback snapshots (no downtime) |

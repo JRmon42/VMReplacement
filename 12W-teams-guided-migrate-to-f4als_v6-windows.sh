@@ -2,6 +2,21 @@
 ###############################################################################
 # 12W-teams-guided-migrate-to-f4als_v6-windows.sh
 #
+# ---------------------------------------------------------------------------
+# DISCLAIMER - READ BEFORE RUNNING
+#   This script is provided AS-IS, with NO WARRANTY of any kind, as best-effort
+#   assistance to speed up a migration. It is NOT a Microsoft product, NOT a
+#   supported Microsoft deliverable, and it is NOT covered by any support
+#   agreement or SLA. It has not been through Microsoft product testing or
+#   release validation.
+#
+#   YOU are responsible for reviewing every command it runs, validating it in a
+#   NON-PRODUCTION environment first, and satisfying your own change-management
+#   and backup requirements before running it against production systems.
+#   The script takes a snapshot and stops at every failed check, but that is a
+#   safety net, not a guarantee. Verify your restore path works BEFORE you start.
+# ---------------------------------------------------------------------------
+#
 # GUIDED, STEP-BY-STEP, SELF-SERVICE migration of a WINDOWS VM from
 # Standard_F4s_v2 (Gen1 / SCSI, has a D: temp disk) to the GENERALLY-AVAILABLE
 # Standard_F4als_v6 (Gen2 / NVMe, NO temp disk).
