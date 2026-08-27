@@ -637,6 +637,10 @@ if [ "$DRYRUN" != 1 ]; then
   # "Creating an EFI system partition" states the MBR system partition is reused only if "the
   # conversion isn't being performed from the full OS", and otherwise "a new EFI system partition
   # is created by shrinking the OS partition". No third source of space is considered.
+  # Nor does pre-creating a partition in that free space help: the disqualifier is not WHICH
+  # partition it is, it is that in full-OS mode whichever partition is the system partition is
+  # by definition in use and therefore cannot be repurposed. In full-OS mode the shrink of C: is
+  # structural - no arrangement of partitions or free space avoids it.
   if grep -q "MBR2GPT=NEED_REBOOT" <<<"$PREP"; then
     if [ "$PREP_ATTEMPT" -ge 2 ]; then
       die "Even after a restart, Windows still cannot shrink C:." "Send us the QUERYMAX / SHRINK_FREED_MB / DISKPART / LAST_UNMOVABLE lines above - LAST_UNMOVABLE names the exact file that blocks the shrink. NOTHING destructive has run - the VM still boots and snapshot '$SNAPSHOT' remains your rollback point."
