@@ -423,10 +423,16 @@ GUEST_PREP_PS='
           $sup = Get-PartitionSupportedSize -DiskNumber $osNum -PartitionNumber $cpart.PartitionNumber -ErrorAction SilentlyContinue
           if ($sup) { Write-Output ("CPART=disk:" + $osNum + " part:" + $cpart.PartitionNumber + " sizeMB:" + [math]::Round($cpart.Size/1MB,0) + " minMB:" + [math]::Round($sup.SizeMin/1MB,0) + " reclaimableMB:" + [math]::Round(($cpart.Size - $sup.SizeMin)/1MB,0)) }
           $cBefore = $cpart.Size
-          # Select the volume by DISK + PARTITION number, never by drive letter: on azumw17011
-          # "select volume C" reported "Volume 1 is the selected volume" and then refused a 512MB
-          # shrink as "smaller than the minimum volume size" - it had picked the 500MB System
-          # Reserved volume, not C:. list volume is included so the mapping is visible in the log.
+          # CPART/reclaimableMB above comes from Get-PartitionSupportedSize, which is only a
+          # THEORETICAL minimum derived from used space - it does NOT account for where unmovable
+          # files physically sit, so it can report tens of GB as reclaimable while the shrink
+          # engine refuses even 512MB. Ask the engine itself first: "shrink querymax" is read-only
+          # and reports the number that actually governs, plus it regenerates event 259 so
+          # LAST_UNMOVABLE below names the blocking file as of NOW rather than days ago.
+          $qmf = Join-Path $env:TEMP "mig-querymax-c.txt"
+          Set-Content -Path $qmf -Value @("select volume C","shrink querymax","exit") -Encoding Ascii
+          $qmo = & "$env:SystemRoot\System32\diskpart.exe" /s $qmf 2>&1
+          Write-Output ("QUERYMAX=" + (($qmo | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
           $dpf = Join-Path $env:TEMP "mig-shrink-c.txt"
           # Select by drive letter. An earlier build used "select disk N" + "select partition M",
           # but diskpart rejected it ("The arguments specified for this command are not valid"),
@@ -614,7 +620,7 @@ if [ "$DRYRUN" != 1 ]; then
   # ignores existing unallocated space and insists on shrinking C: itself.
   if grep -q "MBR2GPT=NEED_REBOOT" <<<"$PREP"; then
     if [ "$PREP_ATTEMPT" -ge 2 ]; then
-      die "Even after a restart, Windows still cannot shrink C:." "Send us the SHRINK_FREED_MB / DISKPART / LAST_UNMOVABLE lines above - LAST_UNMOVABLE names the exact file that blocks the shrink. NOTHING destructive has run - the VM still boots and snapshot '$SNAPSHOT' remains your rollback point."
+      die "Even after a restart, Windows still cannot shrink C:." "Send us the QUERYMAX / SHRINK_FREED_MB / DISKPART / LAST_UNMOVABLE lines above - LAST_UNMOVABLE names the exact file that blocks the shrink. NOTHING destructive has run - the VM still boots and snapshot '$SNAPSHOT' remains your rollback point."
     fi
     warn "Windows cannot shrink C: yet: pagefile.sys and/or hiberfil.sys are still open."
     warn "They have just been DISABLED, and only a restart actually releases them."
@@ -657,7 +663,7 @@ if [ "$DRYRUN" != 1 ]; then
   case "$PREP" in
     *BITLOCKER_ON*)   die "BitLocker is ON on C:." "Suspend/disable BitLocker on C:, then re-run.";;
     *NO_TOOL_WS2016*) die "This guest is Windows Server 2016 (no mbr2gpt)." "Upgrade the guest OS to 2019/2022 first, then re-run.";;
-    *SHRINK_BLOCKED*) die "Windows cannot shrink C: at all, even after a restart and a free-space consolidation." "Every prerequisite has been cleared (pagefile, hibernation file, shadow copies, stale guest-agent traces) and the file system itself reports tens of GB as reclaimable on the CPART= line, yet diskpart, Resize-Partition and mbr2gpt all refuse the shrink. That contradiction usually means the NTFS metadata / volume bitmap is inconsistent, so the one cheap thing left to try in-OS is a file-system check: schedule it with  echo Y|chkdsk C: /f  , restart (allow 10-30 min offline, watch progress via portal > Boot diagnostics > Screenshot, and do NOT interrupt it), then re-run this script. If the shrink is still refused afterwards, we have exhausted the in-OS route; the remaining path is the OFFLINE conversion from WinRE on this VM, where mbr2gpt turns the existing 500MB 'System Reserved' partition into the EFI partition and no shrink of C: is needed at all. Send us the CPART / DISKPART / DISKPART2 / RESIZE / LAST_UNMOVABLE lines above and we will schedule that with you. $ALT_GEN1_HINT NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
+    *SHRINK_BLOCKED*) die "Windows cannot shrink C: at all, even after a restart and a free-space consolidation." "Every prerequisite has been cleared (pagefile, hibernation file, shadow copies, stale guest-agent traces) and the file system itself reports tens of GB as reclaimable on the CPART= line, yet diskpart, Resize-Partition and mbr2gpt all refuse the shrink. That contradiction usually means the NTFS metadata / volume bitmap is inconsistent, so the one cheap thing left to try in-OS is a file-system check: schedule it with  echo Y|chkdsk C: /f  , restart (allow 10-30 min offline, watch progress via portal > Boot diagnostics > Screenshot, and do NOT interrupt it), then re-run this script. If the shrink is still refused afterwards, we have exhausted the in-OS route; the remaining path is the OFFLINE conversion from WinRE on this VM, where mbr2gpt turns the existing 500MB 'System Reserved' partition into the EFI partition and no shrink of C: is needed at all. Send us the QUERYMAX / CPART / DISKPART / DISKPART2 / RESIZE / LAST_UNMOVABLE lines above (QUERYMAX is the authoritative one: it is what the shrink engine itself reports, whereas CPART is only a theoretical estimate and the two routinely disagree) and we will schedule that with you. $ALT_GEN1_HINT NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *VALIDATE_FAIL*)  die "mbr2gpt /validate failed (details captured above: MBR2GPT_OUT / SETUPACT / DISK0 / PART lines)." "Send us those lines - they name the exact reason. Most common: >3 primary partitions, or no room for the ~100MB EFI system partition. Do NOT proceed; we'll advise the targeted fix.";;
     *CONVERT_FAIL*)   die "mbr2gpt /convert failed (diagnostics captured above)." "mbr2gpt validated the disk but could not create the ~100MB EFI partition. In full-OS mode it ALWAYS carves the ESP by shrinking C: - it will not reuse the existing 500MB 'System Reserved' partition ('System partition cannot be removed in full OS mode'), and it ignores unallocated space that already exists on the disk, so growing the disk does not help either. 'Partition final size is <n> (initial size was <n>)' means the shrink freed nothing because an immovable file sits at the end of C:. This is the dead end of the in-OS route: the conversion has to be done with the disk OFFLINE. $ALT_GEN1_HINT Send us the whole output above - or, more simply, the in-guest log: az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts \"Get-Content C:\\Windows\\Temp\\mig-prep-last.log -Tail 80\" --query \"value[0].message\" -o tsv    NOTHING destructive has run - snapshot '$SNAPSHOT' remains your rollback point.";;
     *MBR2GPT=ERROR:*) die "The MBR->GPT step raised an error (see 'MBR2GPT=ERROR:' above)." "Send us that line; the OS disk was not converted, so nothing downstream ran.";;
