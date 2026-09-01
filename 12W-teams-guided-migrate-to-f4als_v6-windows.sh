@@ -38,15 +38,21 @@
 #
 # BEFORE YOU START - IS THE MBR->GPT CONVERSION EVEN NECESSARY?
 #   The whole conversion exists ONLY because v6 sizes refuse Gen1. Several CURRENT-
-#   generation sizes still accept Gen1 unchanged, e.g. Standard_D4as_v5 / D4s_v5, and
+#   generation sizes still accept Gen1 unchanged, e.g. Standard_D4ads_v5 / D4ds_v5, and
 #   moving to one of those is a plain stop/resize/start (~10 min, no mbr2gpt, no risk).
-#   Check what your region offers before committing to the conversion:
-#     az vm list-skus -l <region> --query "[?name=='Standard_D4as_v5'||name=='Standard_F4als_v6'].{Size:name,Gen:capabilities[?name=='HyperVGenerations'].value|[0]}" -o table
+#   Check what your region offers before committing to the conversion (TempDiskMB must
+#   be NON-ZERO -- see the temp-disk rule below):
+#     az vm list-skus -l <region> --query "[?name=='Standard_D4ads_v5'||name=='Standard_D4ds_v5'||name=='Standard_F4als_v6'].{Size:name,Gen:capabilities[?name=='HyperVGenerations'].value|[0],TempDiskMB:capabilities[?name=='MaxResourceVolumeMB'].value|[0]}" -o table
 #   If the requirement is "get off Fsv2 onto current-generation hardware" rather than
 #   "v6 specifically", the v5 route is far cheaper in effort and risk. Note the trade-
-#   offs: it is v5 not v6, the RAM/price tier differs, and it KEEPS the D: temp disk.
+#   offs: it is v5 not v6, and the RAM/price tier differs.
 #   * Windows also blocks an *in-place* resize from a size WITH a temp disk (F4s_v2
-#     has D:) to one WITHOUT (F4als_v6). So we do NOT resize: we REBUILD the VM on
+#     has D:) to one WITHOUT (F4als_v6) -- it fails with "OperationNotAllowed ...
+#     changing from resource disk to non-resource disk VM size and vice-versa is not
+#     allowed". THIS ALSO GOVERNS THE v5 ROUTE ABOVE: pick the names with the extra
+#     'd' (D4ads_v5 / D4ds_v5, which HAVE a temp disk), NOT D4as_v5 / D4s_v5, which
+#     are diskless and will be rejected for exactly the same reason. So we do NOT
+#     resize: we REBUILD the VM on
 #     F4als_v6 from the SAME OS disk + SAME NIC (same name, same private IP). A
 #     rebuild is not a resize, so the restriction (https://aka.ms/AAah4sj) does not
 #     apply. The pagefile is moved off D: first so nothing depends on the temp disk.
@@ -128,7 +134,10 @@ PREP_TIMEOUT="${PREP_TIMEOUT:-4800}" # max seconds to wait for the in-guest prep
 # Appended to every "the MBR->GPT conversion is blocked" message. The conversion is only ever
 # needed because v6 sizes refuse Gen1; several current-generation sizes still accept Gen1 as-is,
 # so an operator stuck here deserves to know the conversion may be avoidable altogether.
-ALT_GEN1_HINT="ALTERNATIVE WORTH CONSIDERING BEFORE GOING FURTHER: this conversion is only required because v6 sizes are Gen2-only. Current-generation sizes such as Standard_D4as_v5 / Standard_D4s_v5 still accept Gen1 unchanged, so moving to one of those is a plain stop/resize/start (~10 min, no mbr2gpt, no risk, and the D: temp disk is kept). Verify with: az vm list-skus -l <region> --query \"[?name=='Standard_D4as_v5'||name=='$TARGET_SIZE'].{Size:name,Gen:capabilities[?name=='HyperVGenerations'].value|[0]}\" -o table   If the requirement is 'current-generation hardware' rather than 'v6 specifically', that route ends this exercise today - it does change size family, RAM and price, so it needs the subscription/project owner's sign-off. EXPECT THIS WHEN YOU TRY IT: while the VM is RUNNING the portal lists that size under 'Unsupported hardware - This size is not currently available on the underlying cluster' and greys it out. That is NOT a Gen1 restriction and not a quota problem - a running VM can only be resized within the hardware cluster it is already placed on, and F4s_v2 (Intel) and D4as_v5 (AMD) are different clusters. DEALLOCATE the VM first (az vm deallocate) and the size normally becomes selectable, because deallocation releases the VM from that cluster and it is re-placed on resize. If it is STILL refused once deallocated, the cause is placement pinning or regional capacity rather than the VM itself - check availabilitySet.id / proximityPlacementGroup.id / zones with 'az vm show', since an availability set or PPG pins every VM in it to one cluster, and check 'az vm list-skus -l <region> --size Standard_D4as_v5' for restrictions on the zone in use."
+# NOTE the 'd' in the target names below: on Windows, Azure refuses to resize between a size WITH
+# a local temp disk and one WITHOUT (and vice-versa), so an F4s_v2 (which has a 32GB D:) can only
+# move to a "with temp disk" size - Dads/Dds, NOT Das/Ds. See the RESOURCE-DISK RULE text below.
+ALT_GEN1_HINT="ALTERNATIVE WORTH CONSIDERING BEFORE GOING FURTHER: this conversion is only required because v6 sizes are Gen2-only. Current-generation sizes such as Standard_D4ads_v5 / Standard_D4ds_v5 still accept Gen1 unchanged, so moving to one of those is a plain stop/resize/start (~10 min, no mbr2gpt, no risk). Verify BOTH the generation and the temp disk in one shot with: az vm list-skus -l <region> --query \"[?name=='Standard_D4ads_v5'||name=='Standard_D4ds_v5'||name=='$TARGET_SIZE'].{Size:name,Gen:capabilities[?name=='HyperVGenerations'].value|[0],TempDiskMB:capabilities[?name=='MaxResourceVolumeMB'].value|[0]}\" -o table   If the requirement is 'current-generation hardware' rather than 'v6 specifically', that route ends this exercise today - it does change size family, RAM and price, so it needs the subscription/project owner's sign-off. RESOURCE-DISK RULE - GET THIS RIGHT OR THE RESIZE IS REJECTED: on Windows, Azure only allows resizing 'with temp disk' -> 'with temp disk' or 'no temp disk' -> 'no temp disk'; crossing over fails with 'OperationNotAllowed ... changing from resource disk to non-resource disk VM size and vice-versa is not allowed' (https://learn.microsoft.com/en-us/azure/virtual-machines/azure-vms-no-temp-disk). In Azure size names the lower-case 'd' before the 's' means 'has a local temp disk': Standard_D4ads_v5 and Standard_D4ds_v5 HAVE one, while Standard_D4as_v5 and Standard_D4s_v5 do NOT. F-series sizes such as F4s_v2 DO have a temp disk, so the correct Gen1-capable targets are the 'ads'/'ds' names - the TempDiskMB column in the query above must be non-zero. Going to a diskless size is possible but is a different, longer procedure: move pagefile.sys off D: to C: first, then rebuild the VM from a snapshot rather than resizing it. EXPECT THIS TOO: while the VM is RUNNING the portal lists the target under 'Unsupported hardware - This size is not currently available on the underlying cluster' and greys it out. That is NOT a Gen1 restriction and not a quota problem - a running VM can only be resized within the hardware cluster it is already placed on, and F4s_v2 (Intel) and the AMD 'a' sizes are different clusters. DEALLOCATE the VM first (az vm deallocate) and the size normally becomes selectable, because deallocation releases the VM from that cluster and it is re-placed on resize. If it is STILL refused once deallocated, the cause is placement pinning or regional capacity rather than the VM itself - check availabilitySet.id / proximityPlacementGroup.id / zones with 'az vm show', since an availability set or PPG pins every VM in it to one cluster, and check 'az vm list-skus -l <region> --size Standard_D4ads_v5' for restrictions on the zone in use."
 
 # ------------------------------ pretty output ------------------------------
 c_reset=$'\033[0m'; c_ok=$'\033[32m'; c_bad=$'\033[31m'; c_hd=$'\033[36m'; c_wn=$'\033[33m'
