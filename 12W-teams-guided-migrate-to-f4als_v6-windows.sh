@@ -429,12 +429,14 @@ GUEST_PREP_PS='
           $dsk = Get-Disk -Number $osNum
           Write-Output ("UNALLOC_MB=" + [math]::Round(($dsk.Size - $dsk.AllocatedSize)/1MB,0))
           try { & "$env:SystemRoot\System32\powercfg.exe" -h off 2>&1 | Out-Null; Write-Output "HIBER=off" } catch { Write-Output ("HIBER=ERROR:" + $_.Exception.Message) }
+          Write-Output "STAGE=shadows"
           try { & "$env:SystemRoot\System32\vssadmin.exe" delete shadows /all /quiet 2>&1 | Out-Null; Write-Output "SHADOWS=deleted" } catch { Write-Output ("SHADOWS=ERROR:" + $_.Exception.Message) }
           # The Azure guest agent writes ETL traces to C:\WindowsAzure\Logs and they are appended
           # continuously - on azumw17011 event 259 named one of them as the last unmovable file.
           # Delete the ones that are no longer open (never touch the current one: the agent is
           # what is executing this very script).
           try {
+            Write-Output "STAGE=agentlogs"
             $old = @(Get-ChildItem -Path "C:\WindowsAzure\Logs" -Recurse -Force -Filter "*.etl" -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt (Get-Date).AddMinutes(-10) })
             $n = 0
             foreach ($f in $old) { try { Remove-Item $f.FullName -Force -ErrorAction Stop; $n++ } catch {} }
@@ -454,6 +456,7 @@ GUEST_PREP_PS='
           # and reports the number that actually governs, plus it regenerates event 259 so
           # LAST_UNMOVABLE below names the blocking file as of NOW rather than days ago.
           $qmf = Join-Path $env:TEMP "mig-querymax-c.txt"
+          Write-Output "STAGE=querymax"
           Set-Content -Path $qmf -Value @("select volume C","shrink querymax","exit") -Encoding Ascii
           $qmo = & "$env:SystemRoot\System32\diskpart.exe" /s $qmf 2>&1
           Write-Output ("QUERYMAX=" + (($qmo | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
@@ -463,6 +466,7 @@ GUEST_PREP_PS='
           # so the shrink never ran. "select volume C" is proven correct on this VM: the
           # "list volume" output shows Volume 1 = C: (Windows, Boot).
           $dpcmds = @("list volume","select volume C","shrink desired=512 minimum=128","exit")
+          Write-Output "STAGE=shrink"
           Set-Content -Path $dpf -Value $dpcmds -Encoding Ascii
           $dpo = & "$env:SystemRoot\System32\diskpart.exe" /s $dpf 2>&1
           Write-Output ("DISKPART=" + (($dpo | Out-String).Trim() -replace "\s*\r?\n\s*"," | "))
@@ -636,7 +640,7 @@ if [ "$DRYRUN" != 1 ]; then
     if [ -z "${PREP//[[:space:]]/}" ]; then
       die "The in-guest preparation returned no result." "The Azure VM guest agent did not run the script (VM still booting, agent unhealthy, run-command blocked, or the Cloud Shell session expired mid-run). Confirm the VM is running and the guest agent is 'Ready' in the portal, then simply re-run this script - it is safe to re-run and will skip anything already done."
     fi
-    die "The in-guest preparation did not finish (see the partial output above)." "The guest script stopped before completing all steps. Copy the full output above and send it to us so we can pinpoint the failing step, then re-run."
+    die "The in-guest preparation did not finish (see the partial output above)." "The guest script stopped before completing all steps. FIRST retrieve the in-guest transcript - it is written to disk as the script runs, so it survives an abrupt termination and shows the exact failing step, whereas the output above is only what was flushed before the process ended: az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts \"Get-Content C:\\Windows\\Temp\\mig-prep-last.log -Tail 100\" --query \"value[0].message\" -o tsv    The last STAGE= line in that transcript names the step that was running. NOTE ON THE PAGEFILE: if 'PAGEFILE=disabled_until_gpt' appears above, the pagefile has been de-configured on this VM and is normally restored automatically once the disk is GPT - which did not happen because this run aborted. Nothing changes until the next restart, but do NOT leave the VM in this state indefinitely: either re-run this script, or restore a system-managed pagefile on C: with   az vm run-command invoke -g $RG -n $VM --command-id RunPowerShellScript --scripts \"\\\$cs=Get-CimInstance Win32_ComputerSystem; \\\$cs | Set-CimInstance -Property @{AutomaticManagedPagefile=\\\$true}; Write-Output PAGEFILE=restored\" --query \"value[0].message\" -o tsv    Then send us the transcript and re-run."
   fi
   # C: could not be shrunk yet because pagefile.sys / hiberfil.sys are still open. They have
   # just been de-configured, and Windows only releases them at the next boot - so restart once
